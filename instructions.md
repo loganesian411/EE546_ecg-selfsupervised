@@ -7,9 +7,9 @@ venv/lib/python3.9/site-packages/pl_bolts/models/self_supervised/resnets.py
 This fixes a versioning issue in one of the installed dependecies.
 
 Dependencies can be installed as
-```python -m pip install -r requirements.txt.```
+```python -m pip install -r requirements.txt```
 
-Make sure to put the preprocessed data in a directory called `ecg_data_processed` in the base directory location.
+Make sure to put the preprocessed data in a directory called `./ecg_data_processed` in the base directory location.
 
 ## Example Usage
 ```
