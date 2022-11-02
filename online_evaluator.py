@@ -2,7 +2,8 @@ import math
 import pdb
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.metrics.functional import accuracy
+# from pytorch_lightning.metrics.functional import accuracy
+from torchmetrics import Accuracy
 from torch.nn import functional as F
 from clinical_ts.eval_utils_cafa import eval_scores, eval_scores_bootstrap
 from sklearn.metrics import roc_auc_score

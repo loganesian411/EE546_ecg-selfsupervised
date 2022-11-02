@@ -477,8 +477,8 @@ def cli_main():
         callbacks.append(fine_tuner)
 
     # configure trainer
-    trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus,
-                      distributed_backend=args.distributed_backend, auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks)
+    trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus, # distributed_backend=args.distributed_backend,
+                      auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks)
 
     # pytorch lightning module
     model = ResNetSimCLR(**config["model"])

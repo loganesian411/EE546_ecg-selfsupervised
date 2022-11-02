@@ -25,8 +25,8 @@ dataset:
   input_shape: (12, 333) #(96,96,3)
   num_workers: 0
   valid_size: 0.05
-  data_folder:    "./data/ptb_xl_fs100"  # "./data/cinc_fs100"
-  target_folders: ["./data/cinc_fs100", "./data/zheng_fs100", "./data/ribeiro_fs100"]
+  data_folder:    "./ecg_data_processed/ptb_xl_fs100"  # "./data/cinc_fs100"
+  target_folders: ["./ecg_data_processed/cinc_fs100", "./ecg_data_processed/zheng_fs100", "./ecg_data_processed/ribeiro_fs100"]
   target_fs: 100
   recreate_data_ptb_xl: False
   filter_cinc: False
@@ -49,8 +49,8 @@ eval_dataset:
   input_shape: (12, 250) #(96,96,3)
   num_workers: 8
   valid_size: 0.05
-  data_folder:   "./data/ptbxl"
-  target_folders: ["./data/ptb_xl_fs100"]
+  data_folder:   "./ecg_data_processed/ptbxl"
+  target_folders: ["./ecg_data_processed/ptb_xl_fs100"]
   target_fs: 100
   recreate_data_ptb_xl: False
   ptb_xl_label: "label_all"       #------V------
