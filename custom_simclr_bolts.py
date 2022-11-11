@@ -21,6 +21,7 @@ from torch.optim.optimizer import Optimizer
 
 
 from models.resnet_simclr import ResNetSimCLR
+from models.onelayer_linear import OneLayerLinear
 import re
 
 import time
@@ -67,13 +68,18 @@ class Projection(nn.Module):
         self.output_dim = output_dim
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.model = nn.Sequential(
-            # nn.AdaptiveAvgPool2d((1, 1)),
-            Flatten(),
-            nn.Linear(self.input_dim, self.hidden_dim, bias=True),
-            # nn.BatchNorm1d(self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.output_dim, bias=True))
+        if hidden_dim:
+            self.model = nn.Sequential(
+                # nn.AdaptiveAvgPool2d((1, 1)),
+                Flatten(),
+                nn.Linear(self.input_dim, self.hidden_dim, bias=True),
+                # nn.BatchNorm1d(self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, self.output_dim, bias=True))
+        else:
+            self.model = nn.Sequential(
+                Flatten(),
+                nn.Linear(self.input_dim, self.output_dim, bias=True))
 
     def forward(self, x):
         x = self.model(x)
@@ -300,11 +306,14 @@ class CustomSimCLR(pl.LightningModule):
             transformation_str), global_step=0)
         self.epoch = 0
 
-    def on_epoch_end(self):
+    def on_train_epoch_end(self):
         self.epoch += 1
 
     def type(self):
-        return self.encoder.features[0][0].weight.type()
+        if hasattr(self.encoder, 'features'):
+            return self.encoder.features[0][0].weight.type()
+        else:
+            return self.encoder.l1.weight.type()
 
     def get_representations(self, x):
         return self.encoder(x)[0]
@@ -313,7 +322,11 @@ class CustomSimCLR(pl.LightningModule):
         return self.encoder
 
     def get_device(self):
-        return self.encoder.features[0][0].weight.device
+        if hasattr(self.encoder, 'features'):
+            return self.encoder.features[0][0].weight.device
+        else:
+            return self.encoder.l1.weight.device
+        
 
     def to_device(self, x):
         return x.type(self.type()).to(self.get_device())
@@ -322,7 +335,7 @@ class CustomSimCLR(pl.LightningModule):
 def parse_args(parent_parser):
     parser = ArgumentParser(parents=[parent_parser], add_help=False)
     parser.add_argument('-t', '--trafos', nargs='+', help='add transformation to data augmentation pipeline',
-                        default=["GaussianNoise", "ChannelResize", "RandomResizedCrop"])
+                        default=["GaussianNoise", "ChannelResize", "RandomResizedCrop", "Normalize"])
     # GaussianNoise
     parser.add_argument(
             '--gaussian_scale', help='std param for gaussian noise transformation', default=0.005, type=float)
@@ -370,6 +383,11 @@ def parse_args(parent_parser):
     parser.add_argument('--out_dim', type=int, help="output dimension of model")
     parser.add_argument('--filter_cinc', default=False, action="store_true", help="only valid if cinc is selected: filter out the ptb data")
     parser.add_argument('--base_model')
+    parser.add_argument('--ftr_multiplier', default=1, type=int,
+                        help='Amount to multiply number of training samples by to define number of features.')
+    parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for ')
+    parser.add_argument('--force_linear_projection', type=bool, default=False,
+                        help='OneLayerLinear models only: use linear w/ no hidden layers.')
     parser.add_argument('--widen',type=int, help="use wide xresnet1d50")
     parser.add_argument('--run_callbacks', default=False, action="store_true", help="run callbacks which asses linear evaluaton and finetuning metrics during pretraining")
     parser.add_argument('--checkpoint_path', default="")
@@ -407,8 +425,12 @@ def pretrain_routine(args):
         config["dataset"]["target_folders"] = args.target_folders
     config["dataset"]["percentage"] = args.percentage if args.percentage is not None else config["dataset"]["percentage"]
     config["dataset"]["filter_cinc"] = args.filter_cinc if args.filter_cinc is not None else config["dataset"]["filter_cinc"]
-    config["model"]["base_model"] = args.base_model if args.base_model is not None else config["model"]["base_model"]
-    config["model"]["widen"] = args.widen if args.widen is not None else config["model"]["widen"]
+    if args.base_model != 'OneLayerLinear': # resnet flavors
+        config["model"]["base_model"] = args.base_model if args.base_model is not None else config["model"]["base_model"]
+        config["model"]["widen"] = args.widen if args.widen is not None else config["model"]["widen"]
+    else: # OneLayerLinear
+        config["model"]["input_size"] = np.product(eval(config["dataset"]["input_shape"]))
+        config["model"]["activation"] = args.activation if args.activation is not None else "F.relu"
     if args.out_dim is not None:
         config["model"]["out_dim"] = args.out_dim
     init_logger(config)
@@ -463,6 +485,11 @@ def cli_main():
 
     # data
     ecg_datamodule = ECGDataModule(config, transformations, t_params)
+    if args.base_model == 'OneLayerLinear':
+        config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
+
+    if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
+        config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
 
     callbacks = []
     if args.run_callbacks:
@@ -481,13 +508,21 @@ def cli_main():
                       auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks)
 
     # pytorch lightning module
-    model = ResNetSimCLR(**config["model"])
+    if args.base_model == "OneLayerLinear":
+        model = OneLayerLinear(config["model"]["input_size"], config["model"]["num_ftrs"],
+            config["model"]["out_dim"], activation=eval(config["model"]["activation"]))
+    else:
+        model = ResNetSimCLR(**config["model"])
     pl_model = CustomSimCLR(
             config["batch_size"], ecg_datamodule.num_samples, warmup_epochs=config["warm_up"], lr=config["lr"],
             out_dim=config["model"]["out_dim"], config=config,
             transformations=ecg_datamodule.transformations, loss_temperature=config["loss"]["temperature"], weight_decay=eval(config["weight_decay"]))
-    pl_model.encoder = model
-    pl_model.projection = Projection(
+    pl_model.encoder = model # Even though the model has a projection
+    if args.base_model == 'OneLayerLinear' and args.force_linear_projection:
+        pl_model.projection = Projection(
+            input_dim=model.l1.in_features, hidden_dim=None, output_dim=config["model"]["out_dim"])
+    else:
+        pl_model.projection = Projection(
             input_dim=model.l1.in_features, hidden_dim=512, output_dim=config["model"]["out_dim"])
 
     # load checkpoint

@@ -24,13 +24,13 @@ dataset:
   s: 1
   input_shape: (12, 333) #(96,96,3)
   num_workers: 0
-  valid_size: 0.05
+  valid_size: 0.05 # not used as far as I can tell.
   data_folder:    "./ecg_data_processed/ptb_xl_fs100"  # "./data/cinc_fs100"
-  target_folders: ["./ecg_data_processed/cinc_fs100", "./ecg_data_processed/zheng_fs100", "./ecg_data_processed/ribeiro_fs100"]
+  target_folders: ["./ecg_data_processed/zheng_fs100", "./ecg_data_processed/ribeiro_fs100"] # "./ecg_data_processed/cinc_fs100", 
   target_fs: 100
   recreate_data_ptb_xl: False
   filter_cinc: False
-  ptb_xl_label: "label_all"
+  ptb_xl_label: "label_diag_superclass" # see below for all the options.
   
 
 eval_epochs: 50
@@ -40,26 +40,27 @@ lin_eval_every_n_epochs: 1
 eval_lr: 3e-2
 eval_wd: 1e-1
 perform_lin_eval: True
-perform_fine_tuning: True
-eval_mode: "fine_tuning"
+perform_fine_tuning: False # True | False
+eval_mode: "linear_evaluation" # "fine_tuning" | "linear_evaluation"
 eval_gradual_freezing: False
 
 eval_dataset:
   s: 1
   input_shape: (12, 250) #(96,96,3)
-  num_workers: 8
-  valid_size: 0.05
+  num_workers: 0 # 8
+  valid_size: 0.05 # not used as far as I can tell.
   data_folder:   "./ecg_data_processed/ptbxl"
   target_folders: ["./ecg_data_processed/ptb_xl_fs100"]
   target_fs: 100
   recreate_data_ptb_xl: False
-  ptb_xl_label: "label_all"       #------V------
-                                  # label_all 71
-                                  # label_diag 44
-                                  # label_form 19
-                                  # label_rhythm 12
-                                  # label_diag_subclass 23
-                                  # label_diag_superclass 5
+  ptb_xl_label: "label_diag_superclass"
+    #------V------
+    # label_all 71
+    # label_diag 44
+    # label_form 19
+    # label_rhythm 12
+    # label_diag_subclass 23
+    # label_diag_superclass 5
 
 
   

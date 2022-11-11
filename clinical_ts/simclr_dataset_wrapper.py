@@ -252,7 +252,7 @@ class SimCLRDataSetWrapper(object):
     def get_train_validation_data_loaders(self, train_ds, val_ds):
 
         train_loader = DataLoader(train_ds, batch_size=self.batch_size,
-                                  num_workers=self.num_workers, pin_memory=True, shuffle=True, drop_last=True)
+                                  num_workers=self.num_workers, pin_memory=True, shuffle=True, drop_last=True) # TODO(loganesian): set False or True (default)
         val_loader = DataLoader(val_ds, batch_size=self.batch_size,
                                 shuffle=False, num_workers=self.num_workers, pin_memory=True)
 
