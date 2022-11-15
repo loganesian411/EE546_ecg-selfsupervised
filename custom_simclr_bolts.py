@@ -22,6 +22,8 @@ from torch.optim.optimizer import Optimizer
 
 from models.resnet_simclr import ResNetSimCLR
 from models.onelayer_linear import OneLayerLinear
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
 import re
 
 import time
@@ -41,6 +43,7 @@ from ecg_datamodule import ECGDataModule
 from pytorch_lightning.loggers import TensorBoardLogger
 from pl_bolts.models.self_supervised.evaluator import Flatten
 import pdb
+
 method="simclr"
 logger = create_logger(__name__)
 def _accuracy(zis, zjs, batch_size):
@@ -60,7 +63,11 @@ def _accuracy(zis, zjs, batch_size):
 def mean(res, key1, key2=None):
     if key2 is not None:
         return torch.stack([x[key1][key2] for x in res]).mean()
-    return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()]).mean()
+    # return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()]).mean()
+    return stack(res, key1).mean()
+
+def stack(res, key1):
+    return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()])
 
 class Projection(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=2048, output_dim=128):
@@ -119,6 +126,7 @@ class CustomSimCLR(pl.LightningModule):
                  loss_temperature=0.5,
                  config=None,
                  transformations=None,
+                 cls_normalizer=None, # None | "std" | "norm"
                  **kwargs):
         """
         Args:
@@ -136,6 +144,7 @@ class CustomSimCLR(pl.LightningModule):
         self.epoch = 0
         self.batch_size = batch_size
         self.num_samples = num_samples
+        self.cls_normalizer = cls_normalizer
         self.save_hyperparameters()
         # pdb.set_trace()
 
@@ -254,45 +263,6 @@ class CustomSimCLR(pl.LightningModule):
 
         return loss
 
-    def training_step(self, batch, batch_idx):
-        z1, z2 = self.shared_forward(batch, batch_idx)
-        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
-        # result = pl.TrainResult(minimize=loss)
-        # result.log('train/train_loss', loss, on_epoch=True)
-
-        acc = _accuracy(z1, z2, z1.shape[0])
-        # result.log('train/train_acc', acc, on_epoch=True)
-        result = {
-            "train/train_loss": loss, 
-            "minimize":loss,
-            "train/train_acc" : acc,
-        }
-        return loss
-
-    def validation_step(self, batch, batch_idx, dataloader_idx):
-        if dataloader_idx != 0:
-            return {}
-        z1, z2 = self.shared_forward(batch, batch_idx)
-        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
-
-        acc = _accuracy(z1, z2, z1.shape[0])
-        results = {
-            'val_loss': loss,
-            'val_acc': torch.tensor(acc)
-        }
-        return results
-
-    def validation_epoch_end(self, outputs):
-        # outputs[0] because we are using multiple datasets!
-        val_loss = mean(outputs[0], 'val_loss')
-        val_acc = mean(outputs[0], 'val_acc')
-
-        log = {
-            'val/val_loss': val_loss,
-            'val/val_acc': val_acc
-        }
-        return {'val_loss': val_loss, 'log': log, 'progress_bar': log}
-
     def on_train_start(self):
         # log configuration
         config_str = re.sub(r"[,\}\{]", "<br/>", str(self.config))
@@ -306,8 +276,99 @@ class CustomSimCLR(pl.LightningModule):
             transformation_str), global_step=0)
         self.epoch = 0
 
+    def training_step(self, batch, batch_idx):
+        # import ipdb; ipdb.set_trace()
+        z1, z2 = self.shared_forward(batch, batch_idx)
+        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
+        acc = _accuracy(z1, z2, z1.shape[0])
+        # result = pl.TrainResult(minimize=loss)
+        # result.log('train/train_loss', loss, on_epoch=True)
+        # result.log('train/train_acc', acc, on_epoch=True)
+        result = {
+            "loss": loss,
+            "acc" : acc,
+            # "minimize": loss,
+            # "train/train_loss": loss,
+            # "train/train_acc" : acc,
+        }
+        # return loss
+        return result
+
+    def training_epoch_end(self, outputs):
+        # import ipdb; ipdb.set_trace()
+        avg_loss = torch.stack([x["loss"] for x in outputs]).mean()
+        avg_acc = torch.stack([x["acc"] for x in outputs]).mean()
+
+        log = {"train/train_loss": avg_loss, "train/train_acc": avg_acc}
+        self.logger.experiment.add_scalar("train/train_loss", avg_loss, self.epoch)
+        self.logger.experiment.add_scalar("train/train_acc", avg_acc, self.epoch)
+
     def on_train_epoch_end(self):
         self.epoch += 1
+
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        results = {}
+        # if dataloader_idx != 0: import ipdb; ipdb.set_trace()
+        # if self.epoch % 5 == 0: # following is copied from shared_forward()
+        #     (x1, y1), (x2, y2) = batch # y1 == y2
+        #     x1 = self.to_device(x1)
+        #     x2 = self.to_device(x2)
+        #     h1 = self.encoder(x1)[0]
+        #     h2 = self.encoder(x2)[0]
+        #     if isinstance(h1, list): h1, h2 = h1[-1], h2[-1]
+        #     import ipdb; ipdb.set_trace()
+        #     results['h1'], results['y1'] = h1, y1
+
+        if dataloader_idx != 0: return results
+        z1, z2 = self.shared_forward(batch, batch_idx)
+        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
+        acc = _accuracy(z1, z2, z1.shape[0])
+        results["val_loss"] = loss
+        results["val_acc"] = torch.tensor(acc)
+        return results
+
+    def validation_epoch_end(self, outputs):
+        # outputs[0] because we are using multiple datasets!
+        # import ipdb; ipdb.set_trace()
+        val_loss = mean(outputs[0], "val_loss")
+        val_acc = mean(outputs[0], "val_acc")
+
+        log = {"val/val_loss": val_loss, "val/val_acc": val_acc}
+        self.logger.experiment.add_scalar("val/val_loss", val_loss, self.epoch)
+        self.logger.experiment.add_scalar("val/val_acc", val_acc, self.epoch)
+
+        results = {"val_loss": val_loss, "val_acc": val_acc}
+
+        # if self.epoch % 5 == 0:
+        #     import ipdb; ipdb.set_trace()
+        #     h1 = torch.stack([stack(this_output, "h1") for this_output in outputs[1:]])
+        #     y1 = torch.stack([stack(this_output, "y1") for this_output in outputs[1:]])
+        #     h1_test, y1_test = stack(outputs[0], "h1"), stack(outputs[0], "y1")
+        #     if self.cls_normalizer == "std'":
+        #         from sklearn.preprocessing import StandardScaler
+        #         scaler = StandardScaler()
+        #         h1 = scaler.fit_transform(h1)
+        #         h1_test = scaler.transform(h1_test)
+        #     elif self.cls_normalizer == "norm": # TODO(loganesian): test to make sure it's ok.
+        #         h1_mean = torch.mean(h1, axis=0, keepdim=True)
+        #         h1 -= h1_mean
+        #         h1 /= torch.norm(h1, axis=0, keepdim=True)
+        #         h1_test -= h1_mean
+        #         h1_test /= torch.norm(h1_test, axis=0, keepdim=True)
+
+        #     reg = LogisticRegression().fit(h1, y1)
+        #     y1_pred = reg.predict(h1_test)
+
+        #     val_cls_acc = accuracy_score(y1_test, y1_pred)
+        #     val_cls_auc = roc_auc_score(y1_test, reg.predict_proba(h1_test))
+        #     results["val_cls_acc"], results["val_cls_auc"] = val_cls_acc, val_cls_auc
+
+        #     log["val/val_cls_acc"], log["val/val_cls_auc"] = val_cls_acc, val_cls_auc
+        #     self.logger.experiment.add_scalar("val/val_cls_acc", val_cls_acc, self.epoch)
+        #     self.logger.experiment.add_scalar("val/val_cls_auc", val_cls_auc, self.epoch)
+
+        results["log"] = results["progress_bar"] = log
+        return results
 
     def type(self):
         if hasattr(self.encoder, 'features'):
@@ -458,6 +519,7 @@ def pretrain_routine(args):
 def aftertrain_routine(config, args, trainer, pl_model, datamodule, callbacks):
     scores = {}
     for ca in callbacks:
+        import ipdb; ipdb.set_trace()
         if isinstance(ca, SSLOnlineEvaluator):
             scores[str(ca)] = {"macro": ca.best_macro}
 
@@ -487,25 +549,27 @@ def cli_main():
     ecg_datamodule = ECGDataModule(config, transformations, t_params)
     if args.base_model == 'OneLayerLinear':
         config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
-
-    if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
-        config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
+        if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
+            config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
 
     callbacks = []
     if args.run_callbacks:
             # callback for online linear evaluation/fine-tuning
-        linear_evaluator = SSLOnlineEvaluator(drop_p=0,
-                                          z_dim=512, num_classes=ptb_num_classes, hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"], mode="linear_evaluation", verbose=False)
+        linear_evaluator = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
+            hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
+            mode="linear_evaluation", verbose=True)
 
-        fine_tuner = SSLOnlineEvaluator(drop_p=0,
-                                          z_dim=512, num_classes=ptb_num_classes, hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"], mode="fine_tuning", verbose=False)
+        fine_tuner = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
+            hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
+            mode="fine_tuning", verbose=False)
    
         callbacks.append(linear_evaluator)
         callbacks.append(fine_tuner)
 
     # configure trainer
     trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus, # distributed_backend=args.distributed_backend,
-                      auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks)
+                      auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks,
+                      log_every_n_steps=1)
 
     # pytorch lightning module
     if args.base_model == "OneLayerLinear":

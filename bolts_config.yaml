@@ -34,9 +34,9 @@ dataset:
   
 
 eval_epochs: 50
-eval_every: 200
+eval_every: 5 # orig: 200
 eval_batch_size: 512
-lin_eval_every_n_epochs: 1
+lin_eval_every_n_epochs: 1 # Unused??
 eval_lr: 3e-2
 eval_wd: 1e-1
 perform_lin_eval: True
