@@ -78,12 +78,14 @@ class SSLOnlineEvaluator(pl.Callback):  # pragma: no-cover
         y = y.type(new_type).to(device)
         return x, y
 
-    def on_sanity_check_start(self, trainer, pl_module):
-        self.val_ds_size = len(trainer.val_dataloaders[0].dataset)
-        self.last_batch_id = len(trainer.val_dataloaders[0])-1
+    ## Had to disable these because the loaders aren't attached to the trainer
+    ## the first time on_sanity_check() and on_sanity_check_end() are called.
+    # def on_sanity_check_start(self, trainer, pl_module):
+    #     self.val_ds_size = len(trainer.val_dataloaders[0].dataset)
+    #     self.last_batch_id = len(trainer.val_dataloaders[0])-1
 
-    def on_sanity_check_end(self, trainer, pl_module):
-        self.macro = 0
+    # def on_sanity_check_end(self, trainer, pl_module):
+    #     self.macro = 0
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
     #def on_validation_batch_end(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
@@ -229,9 +231,14 @@ class SSLOnlineEvaluator(pl.Callback):  # pragma: no-cover
             log_key = "le"
         else:
             log_key = "ft"
-        metrics = {log_key + '_mlp/loss': total_loss,
-                   log_key + '_mlp/macro': macro, log_key + '_mlp/best_macro': self.best_macro}
+        metrics = {
+            log_key + '_mlp/loss': total_loss,
+            log_key + '_mlp/macro': macro,
+            log_key + '_mlp/best_macro': self.best_macro
+        }
         pl_module.logger.log_metrics(metrics, step=trainer.global_step)
+        for metric_name, metric_value in metrics.items():
+            pl_module.logger.experiment.add_scalar(metric_name, metric_value, pl_module.epoch)
 
     def __str__(self):
         return self.mode+"_callback"

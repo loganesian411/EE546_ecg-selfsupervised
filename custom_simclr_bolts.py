@@ -63,11 +63,13 @@ def _accuracy(zis, zjs, batch_size):
 def mean(res, key1, key2=None):
     if key2 is not None:
         return torch.stack([x[key1][key2] for x in res]).mean()
-    # return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()]).mean()
     return stack(res, key1).mean()
 
 def stack(res, key1):
     return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()])
+
+def cat(res, key1):
+    return torch.cat([x[key1] for x in res if type(x) == dict and key1 in x.keys()], 0)
 
 class Projection(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=2048, output_dim=128):
@@ -146,7 +148,6 @@ class CustomSimCLR(pl.LightningModule):
         self.num_samples = num_samples
         self.cls_normalizer = cls_normalizer
         self.save_hyperparameters()
-        # pdb.set_trace()
 
     def configure_optimizers(self):
         global_batch_size = self.trainer.world_size * self.hparams.batch_size
@@ -277,25 +278,16 @@ class CustomSimCLR(pl.LightningModule):
         self.epoch = 0
 
     def training_step(self, batch, batch_idx):
-        # import ipdb; ipdb.set_trace()
         z1, z2 = self.shared_forward(batch, batch_idx)
         loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
         acc = _accuracy(z1, z2, z1.shape[0])
-        # result = pl.TrainResult(minimize=loss)
-        # result.log('train/train_loss', loss, on_epoch=True)
-        # result.log('train/train_acc', acc, on_epoch=True)
         result = {
             "loss": loss,
             "acc" : acc,
-            # "minimize": loss,
-            # "train/train_loss": loss,
-            # "train/train_acc" : acc,
         }
-        # return loss
         return result
 
     def training_epoch_end(self, outputs):
-        # import ipdb; ipdb.set_trace()
         avg_loss = torch.stack([x["loss"] for x in outputs]).mean()
         avg_acc = torch.stack([x["acc"] for x in outputs]).mean()
 
@@ -308,17 +300,6 @@ class CustomSimCLR(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx):
         results = {}
-        # if dataloader_idx != 0: import ipdb; ipdb.set_trace()
-        # if self.epoch % 5 == 0: # following is copied from shared_forward()
-        #     (x1, y1), (x2, y2) = batch # y1 == y2
-        #     x1 = self.to_device(x1)
-        #     x2 = self.to_device(x2)
-        #     h1 = self.encoder(x1)[0]
-        #     h2 = self.encoder(x2)[0]
-        #     if isinstance(h1, list): h1, h2 = h1[-1], h2[-1]
-        #     import ipdb; ipdb.set_trace()
-        #     results['h1'], results['y1'] = h1, y1
-
         if dataloader_idx != 0: return results
         z1, z2 = self.shared_forward(batch, batch_idx)
         loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
@@ -329,44 +310,13 @@ class CustomSimCLR(pl.LightningModule):
 
     def validation_epoch_end(self, outputs):
         # outputs[0] because we are using multiple datasets!
-        # import ipdb; ipdb.set_trace()
         val_loss = mean(outputs[0], "val_loss")
         val_acc = mean(outputs[0], "val_acc")
 
         log = {"val/val_loss": val_loss, "val/val_acc": val_acc}
         self.logger.experiment.add_scalar("val/val_loss", val_loss, self.epoch)
         self.logger.experiment.add_scalar("val/val_acc", val_acc, self.epoch)
-
         results = {"val_loss": val_loss, "val_acc": val_acc}
-
-        # if self.epoch % 5 == 0:
-        #     import ipdb; ipdb.set_trace()
-        #     h1 = torch.stack([stack(this_output, "h1") for this_output in outputs[1:]])
-        #     y1 = torch.stack([stack(this_output, "y1") for this_output in outputs[1:]])
-        #     h1_test, y1_test = stack(outputs[0], "h1"), stack(outputs[0], "y1")
-        #     if self.cls_normalizer == "std'":
-        #         from sklearn.preprocessing import StandardScaler
-        #         scaler = StandardScaler()
-        #         h1 = scaler.fit_transform(h1)
-        #         h1_test = scaler.transform(h1_test)
-        #     elif self.cls_normalizer == "norm": # TODO(loganesian): test to make sure it's ok.
-        #         h1_mean = torch.mean(h1, axis=0, keepdim=True)
-        #         h1 -= h1_mean
-        #         h1 /= torch.norm(h1, axis=0, keepdim=True)
-        #         h1_test -= h1_mean
-        #         h1_test /= torch.norm(h1_test, axis=0, keepdim=True)
-
-        #     reg = LogisticRegression().fit(h1, y1)
-        #     y1_pred = reg.predict(h1_test)
-
-        #     val_cls_acc = accuracy_score(y1_test, y1_pred)
-        #     val_cls_auc = roc_auc_score(y1_test, reg.predict_proba(h1_test))
-        #     results["val_cls_acc"], results["val_cls_auc"] = val_cls_acc, val_cls_auc
-
-        #     log["val/val_cls_acc"], log["val/val_cls_auc"] = val_cls_acc, val_cls_auc
-        #     self.logger.experiment.add_scalar("val/val_cls_acc", val_cls_acc, self.epoch)
-        #     self.logger.experiment.add_scalar("val/val_cls_auc", val_cls_auc, self.epoch)
-
         results["log"] = results["progress_bar"] = log
         return results
 
@@ -387,11 +337,9 @@ class CustomSimCLR(pl.LightningModule):
             return self.encoder.features[0][0].weight.device
         else:
             return self.encoder.l1.weight.device
-        
 
     def to_device(self, x):
         return x.type(self.type()).to(self.get_device())
-
 
 def parse_args(parent_parser):
     parser = ArgumentParser(parents=[parent_parser], add_help=False)
@@ -503,8 +451,7 @@ def pretrain_routine(args):
     date = time.asctime()
     label_to_num_classes = {"label_all": 71, "label_diag": 44, "label_form": 19,
                             "label_rhythm": 12, "label_diag_subclass": 23, "label_diag_superclass": 5}
-    ptb_num_classes = label_to_num_classes[config["eval_dataset"]
-                                           ["ptb_xl_label"]]
+    ptb_num_classes = label_to_num_classes[config["eval_dataset"]["ptb_xl_label"]]
     abr = {"Transpose": "Tr", "TimeOut": "TO", "DynamicTimeWarp": "DTW", "RandomResizedCrop": "RRC", "ChannelResize": "ChR", "GaussianNoise": "GN",
            "TimeWarp": "TW", "ToTensor": "TT", "GaussianBlur": "GB", "BaselineWander": "BlW", "PowerlineNoise": "PlN", "EMNoise": "EM", "BaselineShift": "BlS"}
     trs = re.sub(r"[,'\]\[]", "", str([abr[str(tr)] if abr[str(tr)] not in [
@@ -546,7 +493,7 @@ def cli_main():
     config, dataset, date, transformations, t_params, ptb_num_classes, tb_logger = pretrain_routine(args)
 
     # data
-    ecg_datamodule = ECGDataModule(config, transformations, t_params)
+    ecg_datamodule = ECGDataModule(config, transformations, t_params, ptb_num_classes=ptb_num_classes)
     if args.base_model == 'OneLayerLinear':
         config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
         if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
@@ -559,12 +506,13 @@ def cli_main():
             hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
             mode="linear_evaluation", verbose=True)
 
-        fine_tuner = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
-            hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
-            mode="fine_tuning", verbose=False)
+        # TODO(loganesian): wrap in a flag.
+        # fine_tuner = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
+        #     hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
+        #     mode="fine_tuning", verbose=False)
    
         callbacks.append(linear_evaluator)
-        callbacks.append(fine_tuner)
+        # callbacks.append(fine_tuner)
 
     # configure trainer
     trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus, # distributed_backend=args.distributed_backend,
@@ -598,7 +546,7 @@ def cli_main():
             raise("checkpoint does not exist")
 
     # start training
-    trainer.fit(pl_model, ecg_datamodule)
+    trainer.fit(pl_model, datamodule=ecg_datamodule)
 
     aftertrain_routine(config, args, trainer, pl_model, ecg_datamodule, callbacks)
 
