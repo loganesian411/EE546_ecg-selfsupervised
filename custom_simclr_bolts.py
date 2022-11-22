@@ -343,6 +343,7 @@ class CustomSimCLR(pl.LightningModule):
 
 def parse_args(parent_parser):
     parser = ArgumentParser(parents=[parent_parser], add_help=False)
+    parser.add_argument('--config_name', default='bolts_config.yaml')
     parser.add_argument('-t', '--trafos', nargs='+', help='add transformation to data augmentation pipeline',
                         default=["GaussianNoise", "ChannelResize", "RandomResizedCrop", "Normalize"])
     # GaussianNoise
@@ -392,6 +393,8 @@ def parse_args(parent_parser):
     parser.add_argument('--out_dim', type=int, help="output dimension of model")
     parser.add_argument('--filter_cinc', default=False, action="store_true", help="only valid if cinc is selected: filter out the ptb data")
     parser.add_argument('--base_model')
+    parser.add_argument('--lin_params_use_batch_size', default=False,
+                        help='overparameterize as a function of batch_size')
     parser.add_argument('--ftr_multiplier', default=1, type=int,
                         help='Amount to multiply number of training samples by to define number of features.')
     parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for ')
@@ -422,9 +425,9 @@ def pretrain_routine(args):
                 "epsilon": args.epsilon, "magnitude_range": args.magnitude_range, "downsample_ratio": args.downsample_ratio, "to_crop_ratio_range": args.to_crop_ratio_range,
                 "bw_cmax":0.1, "em_cmax":0.5, "pl_cmax":0.2, "bs_cmax":1}
     transformations = args.trafos
-    checkpoint_config = os.path.join("checkpoints", "bolts_config.yaml")
+    checkpoint_config = os.path.join("checkpoints", args.config_name)
     config_file = checkpoint_config if args.resume and os.path.isfile(
-        checkpoint_config) else "bolts_config.yaml"
+        checkpoint_config) else args.config_name
     config = yaml.load(open(config_file, "r"), Loader=yaml.FullLoader)
     args_dict = vars(args)
     for key in set(config.keys()).union(set(args_dict.keys())):
@@ -458,7 +461,7 @@ def pretrain_routine(args):
                  "TT", "Tr"] else '' for tr in dataset.transformations]))
     name = str(date) + "_" + method + "_" + str(
         time.time_ns())[-3:] + "_" + trs[1:]
-    tb_logger = TensorBoardLogger(args.log_dir, name=name, version='')
+    tb_logger = TensorBoardLogger(args.log_dir, name=name, version='', log_graph=True)
     config["log_dir"] = os.path.join(args.log_dir, name)
     print(config)
     return config, dataset, date, transformations, t_params, ptb_num_classes, tb_logger
@@ -495,7 +498,10 @@ def cli_main():
     # data
     ecg_datamodule = ECGDataModule(config, transformations, t_params, ptb_num_classes=ptb_num_classes)
     if args.base_model == 'OneLayerLinear':
-        config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
+        if args.lin_params_use_batch_size:
+            config["model"]["num_ftrs"] = config["batch_size"] * args.ftr_multiplier
+        else:
+            config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
         if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
             config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
 
@@ -512,9 +518,8 @@ def cli_main():
         #     mode="fine_tuning", verbose=False)
    
         callbacks.append(linear_evaluator)
-        # callbacks.append(fine_tuner)
+        # callbacks.append(fine_tuner) # TOOD(loganesian): wrap in a flag.
 
-    # configure trainer
     trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus, # distributed_backend=args.distributed_backend,
                       auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks,
                       log_every_n_steps=1)
@@ -525,6 +530,7 @@ def cli_main():
             config["model"]["out_dim"], activation=eval(config["model"]["activation"]))
     else:
         model = ResNetSimCLR(**config["model"])
+    # import ipdb; ipdb.set_trace()
     pl_model = CustomSimCLR(
             config["batch_size"], ecg_datamodule.num_samples, warmup_epochs=config["warm_up"], lr=config["lr"],
             out_dim=config["model"]["out_dim"], config=config,
