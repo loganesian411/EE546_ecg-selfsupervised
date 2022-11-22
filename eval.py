@@ -11,6 +11,7 @@ import pickle
 from models.resnet_simclr import ResNetSimCLR
 from clinical_ts.cpc import CPCModel
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,14 +24,19 @@ from clinical_ts.timeseries_utils import aggregate_predictions
 import pdb
 from copy import deepcopy
 from os.path import join, isdir
+import ipdb
+#Command: python eval.py --method simclr --use_pretrained --l_epochs 50 --linear_evaluation 
+# --model_file "./experiment_logs/Tue Nov 15 00:01:44 2022_simclr_000_RRC TO /checkpoints/model.ckpt"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# create a summary writer using the specified folder name.
+writer = SummaryWriter("Eval.py metrics")
 
 def parse_args():
     parser = argparse.ArgumentParser("Finetuning tests")
-    parser.add_argument("--model_file")
+    parser.add_argument("--model_file", type=str)
     parser.add_argument("--method")
-    parser.add_argument("--dataset", nargs="+", default="./data/ptb_xl_fs100")
+    parser.add_argument("--dataset", nargs="+", default="./ecg_data_processed/ptb_xl_fs100")
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--discriminative_lr", default=False, action="store_true")
     parser.add_argument("--num_workers", type=int, default=8)
@@ -48,7 +54,7 @@ def parse_args():
     parser.add_argument("--test", action="store_true", default=False)
     parser.add_argument("--verbose", action="store_true", default=False)
     parser.add_argument("--cpc", action="store_true", default=False)
-    parser.add_argument("--model_location")
+    parser.add_argument("--model_location", type=str)
     parser.add_argument("--l_epochs", type=int, default=0, help="number of head-only epochs (these are performed first)")
     parser.add_argument("--f_epochs", type=int, default=0, help="number of finetuning epochs (these are perfomed after head-only training")
     parser.add_argument("--normalize", action="store_true", default=False, help="normalize dataset with ptbxl mean and std")
@@ -57,6 +63,7 @@ def parse_args():
     parser.add_argument("--conv_encoder", action="store_true", default=False)
     parser.add_argument("--base_model", default="xresnet1d50")
     parser.add_argument("--widen", default=1, type=int, help="use wide xresnet1d50")
+    parser.add_argument("--head_only_epochs", type=int, default=0, help="how many epochs to only train the linear head")
     args = parser.parse_args()
     return args
 
@@ -110,6 +117,7 @@ def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
 
 
 def adjust(model, num_classes, hidden=False):
+    # ipdb.set_trace()
     in_features = model.l1.in_features
     last_layer = torch.nn.modules.linear.Linear(
         in_features, num_classes).to(device)
@@ -136,6 +144,7 @@ def adjust(model, num_classes, hidden=False):
 
 
 def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer="adam", discriminative_lr_factor=1):
+    # ipdb.set_trace()
     loss_fn = F.binary_cross_entropy_with_logits
     if base_model == "xresnet1d":
         wd = 1e-1
@@ -304,6 +313,7 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
 
 
 def evaluate(model, dataloader, idmap, lbl_itos, cpc=False):
+    # ipdb.set_trace()
     preds, targs = eval_model(model, dataloader, cpc=cpc)
     scores = eval_scores(targs, preds, classes=lbl_itos, parallel=True)
     preds_agg, targs_agg = aggregate_predictions(preds, targs, idmap)
@@ -325,6 +335,7 @@ def set_train_eval(model, cpc, linear_evaluation):
 
 
 def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
+    ipdb.set_trace()
     if head_only:
         if linear_evaluation:
             print("linear evaluation for {} epochs".format(epochs))
@@ -378,6 +389,7 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             loss.backward()
             optimizer.step()
             total_loss_one_epoch += loss.item()
+            writer.add_scalar("Total_loss_one_epoch", total_loss_one_epoch, epoch)
             if(batch_idx % 100 == 0):
                 print(epoch, batch_idx, loss.item())
         loss_per_epoch.append(total_loss_one_epoch)
@@ -385,6 +397,8 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
         preds, macro, macro_agg = evaluate(
             model, valid_loader, val_idmap, lbl_itos, cpc=cpc)
         macro_agg_per_epoch.append(macro_agg)
+        # ipdb.set_trace()
+        writer.add_scalar("Aggregrated Macro for multiple pred", total_loss_one_epoch, epoch)
 
         print("loss:", total_loss_one_epoch)
         print("aggregated macro:", macro_agg)
@@ -398,7 +412,7 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
                 model, test_loader, test_idmap, lbl_itos, cpc=cpc)
 
         set_train_eval(model, cpc, linear_evaluation)
-
+    writer.flush()
     if epochs > 0:
         sanity_check(model, state_dict_pre, linear_evaluation, head_only)
     return loss_per_epoch, macro_agg_per_epoch, best_macro, best_macro_agg, test_macro, test_macro_agg, best_epoch, best_preds
@@ -484,12 +498,14 @@ def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, perce
 
 
 if __name__ == "__main__":
+    
     args = parse_args()
     dataset, train_loader, _ = get_dataset(
         args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=args.test, normalize=args.normalize)
     _, _, valid_loader = get_dataset(
         args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=False, normalize=args.normalize)
     val_idmap = dataset.val_ds_idmap
+    # ipdb.set_trace()
     dataset, _, test_loader = get_dataset(
         args.batch_size, args.num_workers, args.dataset, test=True, normalize=args.normalize)
     test_idmap = dataset.val_ds_idmap
@@ -532,14 +548,17 @@ if __name__ == "__main__":
     model = load_model(
         args.linear_evaluation, 71, args.use_pretrained or args.load_finetuned, hidden=args.hidden,
         location=args.model_file, discriminative_lr=args.discriminative_lr, method=args.method)
+
+    
     loss_fn, optimizer = configure_optimizer(
         model, args.batch_size, head_only=True, discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
+
     if not args.eval_only:
         print("train model...")
         if not isdir(save_model_at):
             os.mkdir(save_model_at)
-
-        l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.l_epochs, loss_fn,
+        # ipdb.set_trace()
+        l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.head_only_epochs, loss_fn,
                                                                             optimizer, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                             val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
         if bm != 0:
@@ -587,4 +606,5 @@ if __name__ == "__main__":
     print("dumped results to", filename)
     print(res)
     print("Done!")
+    writer.close()
 
