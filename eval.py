@@ -25,6 +25,8 @@ import pdb
 from copy import deepcopy
 from os.path import join, isdir
 import ipdb
+from torchviz import make_dot
+
 #Command: python eval.py --method simclr --use_pretrained --l_epochs 50 --linear_evaluation 
 # --model_file "./experiment_logs/Tue Nov 15 00:01:44 2022_simclr_000_RRC TO /checkpoints/model.ckpt"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -64,6 +66,7 @@ def parse_args():
     parser.add_argument("--base_model", default="xresnet1d50")
     parser.add_argument("--widen", default=1, type=int, help="use wide xresnet1d50")
     parser.add_argument("--head_only_epochs", type=int, default=0, help="how many epochs to only train the linear head")
+    parser.add_argument("--visualize", type=bool, default=False)
     args = parser.parse_args()
     return args
 
@@ -117,7 +120,7 @@ def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
 
 
 def adjust(model, num_classes, hidden=False):
-    # ipdb.set_trace()
+    
     in_features = model.l1.in_features
     last_layer = torch.nn.modules.linear.Linear(
         in_features, num_classes).to(device)
@@ -144,7 +147,7 @@ def adjust(model, num_classes, hidden=False):
 
 
 def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer="adam", discriminative_lr_factor=1):
-    # ipdb.set_trace()
+    
     loss_fn = F.binary_cross_entropy_with_logits
     if base_model == "xresnet1d":
         wd = 1e-1
@@ -223,6 +226,7 @@ def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=Fa
 
 
 def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr=False, hidden=False, conv_encoder=False, bn_head=False, ps_head=0.5, location="./checkpoints/moco_baselinewonder200.ckpt", method="simclr", base_model="xresnet1d50", out_dim=16, widen=1):
+    
     discriminative_lr_factor = 1
     if use_pretrained:
         print("load model from " + location)
@@ -250,7 +254,7 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
 
             model = CPCModel(input_channels=12, strides=strides, kss=kss, features=[512]*4, n_hidden=512, n_layers=2, mlp=False, lstm=True, bias_proj=False,
                              num_classes=num_classes, skip_encoder=False, bn_encoder=True, lin_ftrs_head=lin_ftrs_head, ps_head=ps_head, bn_head=bn_head).to(device)
-
+            
             if "state_dict" in lightning_state_dict.keys():
                 print("load pretrained model")
                 model_state_dict = get_new_state_dict(
@@ -280,6 +284,8 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
                     base_dict, model_state_dict, method=method)
                 model.load_state_dict(model_state_dict)
                 adjust(model, num_classes, hidden=hidden)
+        
+
 
     else:
         if "xresnet1d" in base_model:
@@ -313,7 +319,7 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
 
 
 def evaluate(model, dataloader, idmap, lbl_itos, cpc=False):
-    # ipdb.set_trace()
+    
     preds, targs = eval_model(model, dataloader, cpc=cpc)
     scores = eval_scores(targs, preds, classes=lbl_itos, parallel=True)
     preds_agg, targs_agg = aggregate_predictions(preds, targs, idmap)
@@ -335,7 +341,7 @@ def set_train_eval(model, cpc, linear_evaluation):
 
 
 def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
-    ipdb.set_trace()
+    
     if head_only:
         if linear_evaluation:
             print("linear evaluation for {} epochs".format(epochs))
@@ -371,6 +377,9 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
     best_preds = None
     test_macro = 0
     test_macro_agg = 0
+    #
+    images, labels = next(iter(train_loader))
+    writer.add_graph(model,images)
     for epoch in tqdm(range(epochs)):
         if type(lr_schedule) == dict:
             if epoch in lr_schedule.keys():
@@ -389,7 +398,7 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             loss.backward()
             optimizer.step()
             total_loss_one_epoch += loss.item()
-            writer.add_scalar("Total_loss_one_epoch", total_loss_one_epoch, epoch)
+            
             if(batch_idx % 100 == 0):
                 print(epoch, batch_idx, loss.item())
         loss_per_epoch.append(total_loss_one_epoch)
@@ -397,9 +406,9 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
         preds, macro, macro_agg = evaluate(
             model, valid_loader, val_idmap, lbl_itos, cpc=cpc)
         macro_agg_per_epoch.append(macro_agg)
-        # ipdb.set_trace()
+        
         writer.add_scalar("Aggregrated Macro for multiple pred", total_loss_one_epoch, epoch)
-
+        writer.add_scalar("Total_loss_one_epoch", total_loss_one_epoch, epoch)
         print("loss:", total_loss_one_epoch)
         print("aggregated macro:", macro_agg)
         if macro_agg > best_macro_agg:
@@ -412,7 +421,6 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
                 model, test_loader, test_idmap, lbl_itos, cpc=cpc)
 
         set_train_eval(model, cpc, linear_evaluation)
-    writer.flush()
     if epochs > 0:
         sanity_check(model, state_dict_pre, linear_evaluation, head_only)
     return loss_per_epoch, macro_agg_per_epoch, best_macro, best_macro_agg, test_macro, test_macro_agg, best_epoch, best_preds
@@ -505,7 +513,7 @@ if __name__ == "__main__":
     _, _, valid_loader = get_dataset(
         args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=False, normalize=args.normalize)
     val_idmap = dataset.val_ds_idmap
-    # ipdb.set_trace()
+    
     dataset, _, test_loader = get_dataset(
         args.batch_size, args.num_workers, args.dataset, test=True, normalize=args.normalize)
     test_idmap = dataset.val_ds_idmap
@@ -552,12 +560,13 @@ if __name__ == "__main__":
     
     loss_fn, optimizer = configure_optimizer(
         model, args.batch_size, head_only=True, discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
-
+    
+   
     if not args.eval_only:
         print("train model...")
         if not isdir(save_model_at):
             os.mkdir(save_model_at)
-        # ipdb.set_trace()
+        
         l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.head_only_epochs, loss_fn,
                                                                             optimizer, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                             val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
@@ -608,3 +617,10 @@ if __name__ == "__main__":
     print("Done!")
     writer.close()
 
+
+ # if args.visualize:
+    #     print("Visualization")
+    #     data, labal = next(iter(train_loader))
+    #     y = model(data)
+    #     make_dot(y.mean(), params=dict(model.named_parameters()))
+    #     pass 
