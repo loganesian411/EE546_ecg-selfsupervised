@@ -32,7 +32,7 @@ from torchviz import make_dot
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # create a summary writer using the specified folder name.
-writer = SummaryWriter("Eval.py metrics")
+writer = SummaryWriter("linear_eval_metrics") # TODO(loganesian): don't hardcode this
 
 def parse_args():
     parser = argparse.ArgumentParser("Finetuning tests")
@@ -145,7 +145,7 @@ def adjust(model, num_classes, hidden=False):
 
     model.forward = def_forward(model)
 
-
+# TODO(loganesian): add support for linear
 def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer="adam", discriminative_lr_factor=1):
     
     loss_fn = F.binary_cross_entropy_with_logits
@@ -224,7 +224,7 @@ def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=Fa
         raise("model unknown")
     return loss_fn, optimizer
 
-
+# TODO(loganesian): add support for linear
 def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr=False, hidden=False, conv_encoder=False, bn_head=False, ps_head=0.5, location="./checkpoints/moco_baselinewonder200.ckpt", method="simclr", base_model="xresnet1d50", out_dim=16, widen=1):
     
     discriminative_lr_factor = 1
@@ -287,7 +287,7 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
         
 
 
-    else:
+    else: # not use_pretrained (supervised training)
         if "xresnet1d" in base_model:
             model = ResNetSimCLR(base_model, out_dim, hidden=hidden, widen=widen).to(device)
             adjust(model, num_classes, hidden=hidden)
@@ -329,7 +329,7 @@ def evaluate(model, dataloader, idmap, lbl_itos, cpc=False):
     macro_agg = scores_agg["label_AUC"]["macro"]
     return preds, macro, macro_agg
 
-
+# TODO(loganesian): add support for linear
 def set_train_eval(model, cpc, linear_evaluation):
     if linear_evaluation:
         if cpc:
@@ -407,9 +407,11 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             model, valid_loader, val_idmap, lbl_itos, cpc=cpc)
         macro_agg_per_epoch.append(macro_agg)
         
-        writer.add_scalar("Aggregrated Macro for multiple pred", total_loss_one_epoch, epoch)
+        writer.add_scalar("Aggregrated Macro for multiple pred", macro_agg, epoch)
+        writer.add_scalar("Macro", macro, epoch)
         writer.add_scalar("Total_loss_one_epoch", total_loss_one_epoch, epoch)
         print("loss:", total_loss_one_epoch)
+        print("macro:", macro)
         print("aggregated macro:", macro_agg)
         if macro_agg > best_macro_agg:
             torch.save(model.state_dict(), save_model_at)
@@ -591,7 +593,7 @@ if __name__ == "__main__":
         result_macros.append(bm)
         result_macros_agg.append(bm_agg)
 
-    else:
+    else: # args.eval_only
         preds, eval_macro, eval_macro_agg = evaluate(
             model, test_loader, test_idmap, lbl_itos, cpc=(args.method == "cpc"))
         result_macros.append(eval_macro)
