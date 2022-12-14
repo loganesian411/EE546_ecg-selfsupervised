@@ -528,8 +528,10 @@ def cli_main():
 
     # pytorch lightning module
     if args.base_model == "OneLayerLinear":
+        # hardcoding 512 to match the dimensionality of the features learned with resnet model
+        # the only parameter we will vary is the number of hidden units.
         model = OneLayerLinear(config["model"]["input_size"], config["model"]["num_ftrs"],
-            config["model"]["out_dim"], activation=eval(config["model"]["activation"]))
+            512, activation=eval(config["model"]["activation"]))
     else:
         model = ResNetSimCLR(**config["model"])
 
