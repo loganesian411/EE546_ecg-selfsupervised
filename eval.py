@@ -34,6 +34,9 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # create a summary writer using the specified folder name.
 writer = SummaryWriter("linear_eval_metrics") # TODO(loganesian): don't hardcode this
 
+label_to_num_classes = {"label_all": 71, "label_diag": 44, "label_form": 19,
+    "label_rhythm": 12, "label_diag_subclass": 23, "label_diag_superclass": 5}
+
 def parse_args():
     parser = argparse.ArgumentParser("Finetuning tests")
     parser.add_argument("--model_file", type=str)
@@ -57,6 +60,7 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true", default=False)
     parser.add_argument("--cpc", action="store_true", default=False)
     parser.add_argument("--model_location", type=str)
+    parser.add_argument("--ptb_xl_label", type=str, default="label_all", choices=list(label_to_num_classes.keys()))
     parser.add_argument("--l_epochs", type=int, default=0, help="number of head-only epochs (these are performed first)")
     parser.add_argument("--f_epochs", type=int, default=0, help="number of finetuning epochs (these are perfomed after head-only training")
     parser.add_argument("--normalize", action="store_true", default=False, help="normalize dataset with ptbxl mean and std")
@@ -485,23 +489,23 @@ def eval_model(model, valid_loader, cpc=False):
     return preds, targs
 
 
-def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, percentage=1.0, folds=8, t_params=None, test=False, normalize=False):
+def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, percentage=1.0, folds=8, t_params=None, test=False, normalize=False, ptb_xl_label="label_all"):
     if apply_noise:
         transformations = ["BaselineWander",
                            "PowerlineNoise", "EMNoise", "BaselineShift"]
         if normalize:
             transformations.append("Normalize")
         dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-                                       mode="linear_evaluation", transformations=transformations, percentage=percentage, folds=folds, t_params=t_params, test=test, ptb_xl_label="label_all")
+                                       mode="linear_evaluation", transformations=transformations, percentage=percentage, folds=folds, t_params=t_params, test=test, ptb_xl_label=ptb_xl_label)
     else:
         if normalize:
             # always use PTB-XL stats
             transformations = ["Normalize"]
             dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-            mode="linear_evaluation", percentage=percentage, folds=folds, test=test, transformations=transformations, ptb_xl_label="label_all")
+            mode="linear_evaluation", percentage=percentage, folds=folds, test=test, transformations=transformations, ptb_xl_label=ptb_xl_label)
         else:
             dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-                                           mode="linear_evaluation", percentage=percentage, folds=folds, test=test, ptb_xl_label="label_all")
+                                           mode="linear_evaluation", percentage=percentage, folds=folds, test=test, ptb_xl_label=ptb_xl_label)
 
     train_loader, valid_loader = dataset.get_data_loaders()
     return dataset, train_loader, valid_loader
@@ -511,13 +515,13 @@ if __name__ == "__main__":
     
     args = parse_args()
     dataset, train_loader, _ = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=args.test, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=args.test, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     _, _, valid_loader = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=False, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=False, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     val_idmap = dataset.val_ds_idmap
     
     dataset, _, test_loader = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, test=True, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.dataset, test=True, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     test_idmap = dataset.val_ds_idmap
     lbl_itos = dataset.lbl_itos
     tag = "f=" + str(args.folds) + "_" + args.tag
@@ -537,7 +541,7 @@ if __name__ == "__main__":
             raise("noise level does not exist")
         t_params = t_params_by_level[args.noise_level]
         dataset, _, noise_valid_loader = get_dataset(
-            args.batch_size, args.num_workers, args.dataset, apply_noise=True, t_params=t_params, test=args.test)
+            args.batch_size, args.num_workers, args.dataset, apply_noise=True, t_params=t_params, test=args.test, ptb_xl_label=args.ptb_xl_label)
     else:
         noise_valid_loader = None
     losses, macros, predss, result_macros, result_macros_agg, test_macros, test_macros_agg, noised_macros, noised_macros_agg = [
