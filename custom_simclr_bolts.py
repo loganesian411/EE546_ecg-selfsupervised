@@ -16,6 +16,7 @@ from pl_bolts.optimizers.lars_scheduling import LARSWrapper
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities import AMPType
@@ -389,7 +390,7 @@ def parse_args(parent_parser):
     parser.add_argument('--out_dim', type=int, help="output dimension of model")
     parser.add_argument('--filter_cinc', default=False, action="store_true", help="only valid if cinc is selected: filter out the ptb data")
     parser.add_argument('--base_model')
-    parser.add_argument('--ftr_multiplier', default=1, type=int,
+    parser.add_argument('--ftr_multiplier', default=1, type=float,
                         help='Amount to multiply number of training samples by to define number of features.')
     parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for ')
     parser.add_argument('--optimizer_name', type=str, default="Adam",
@@ -398,6 +399,7 @@ def parse_args(parent_parser):
                         help='OneLayerLinear models only: use linear w/ no hidden layers.')
     parser.add_argument('--widen',type=int, help="use wide xresnet1d50")
     parser.add_argument('--run_callbacks', default=False, action="store_true", help="run callbacks which asses linear evaluaton and finetuning metrics during pretraining")
+    parser.add_argument('--early_stopping', default=False, action="store_true", help="enable early stopping based on validation cross entropy loss")
     parser.add_argument('--checkpoint_path', default="")
     return parser
 
@@ -500,10 +502,14 @@ def cli_main():
         config["model"]["num_ftrs"] *= args.ftr_multiplier
         config["model"]["num_ftrs"] = int(config["model"]["num_ftrs"])
 
-    # callbacks = [EarlyStopping(monitor="val/val_loss", mode="min")]
     callbacks = []
+    if args.early_stopping:
+        callbacks.append(EarlyStopping(monitor="val/val_loss", mode="min"))
+        callbacks.append(ModelCheckpoint(
+            dirpath=os.path.join(config["log_dir"], "checkpoints"),
+            monitor="val/val_loss", mode="min", save_top_k=1, save_last=True))
     if args.run_callbacks:
-            # callback for online linear evaluation/fine-tuning
+        # callback for online linear evaluation/fine-tuning
         linear_evaluator = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
             hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
             mode="linear_evaluation", verbose=True)
