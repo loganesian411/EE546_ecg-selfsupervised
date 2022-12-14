@@ -1,48 +1,36 @@
-import pytorch_lightning as pl
-# from pl_bolts.models.self_supervised import SimCLR
-from pl_bolts.optimizers.lars_scheduling import LARSWrapper
-from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-from torch.optim import Adam
-import torch
-import re
-import pdb 
-
-import math
 from argparse import ArgumentParser
-from typing import Callable, Optional
-
-import numpy as np
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from pytorch_lightning.utilities import AMPType
-from torch import nn
-from torch.optim.optimizer import Optimizer
-
-
-from models.resnet_simclr import ResNetSimCLR
-from models.onelayer_linear import OneLayerLinear
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
-import re
-
-import time
-import pickle
-import yaml
-import logging
-import os
 from clinical_ts.simclr_dataset_wrapper import SimCLRDataSetWrapper
 from clinical_ts.create_logger import create_logger
-import pickle
-from pytorch_lightning import Trainer, seed_everything
-
-from torch import nn
-from torch.nn import functional as F
-from online_evaluator import SSLOnlineEvaluator
 from ecg_datamodule import ECGDataModule
-from pytorch_lightning.loggers import TensorBoardLogger
-from pl_bolts.models.self_supervised.evaluator import Flatten
+import logging
+import math
+from models.resnet_simclr import ResNetSimCLR
+from models.onelayer_linear import OneLayerLinear
+import numpy as np
+from online_evaluator import SSLOnlineEvaluator
+import os
 import pdb
+import pickle
+from pl_bolts.models.self_supervised.evaluator import Flatten
+from pl_bolts.optimizers.lars_scheduling import LARSWrapper
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.utilities import AMPType
+import re
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from torch.optim import Adam, SGD
+import torch
+from torch import nn
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.optim.optimizer import Optimizer
+import time
+from typing import Callable, Optional
+import yaml
 
 method="simclr"
 logger = create_logger(__name__)
@@ -129,6 +117,7 @@ class CustomSimCLR(pl.LightningModule):
                  config=None,
                  transformations=None,
                  cls_normalizer=None, # None | "std" | "norm"
+                 optimizer_name='Adam',
                  **kwargs):
         """
         Args:
@@ -147,41 +136,47 @@ class CustomSimCLR(pl.LightningModule):
         self.batch_size = batch_size
         self.num_samples = num_samples
         self.cls_normalizer = cls_normalizer
+        self.optimizer_name = optimizer_name
         self.save_hyperparameters()
 
     def configure_optimizers(self):
-        global_batch_size = self.trainer.world_size * self.hparams.batch_size
-        self.train_iters_per_epoch = self.hparams.num_samples // global_batch_size
         # TRICK 1 (Use lars + filter weights)
         # exclude certain parameters
         parameters = self.exclude_from_wt_decay(
             self.named_parameters(),
             weight_decay=self.hparams.opt_weight_decay
         )
+        if self.optimizer_name == 'Adam':
+            global_batch_size = self.trainer.world_size * self.hparams.batch_size
+            self.train_iters_per_epoch = self.hparams.num_samples // global_batch_size
+            
+            # optimizer = LARSWrapper(Adam(parameters, lr=self.hparams.lr))
+            optimizer = Adam(parameters, lr=self.hparams.lr)
+            
+            # Trick 2 (after each step)
+            self.hparams.warmup_epochs = self.hparams.warmup_epochs * self.train_iters_per_epoch
+            max_epochs = self.trainer.max_epochs * self.train_iters_per_epoch
 
+            # TODO(loganesian): Enable different scheduler for linear model.
+            linear_warmup_cosine_decay = LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.hparams.warmup_epochs,
+                max_epochs=max_epochs,
+                warmup_start_lr=0,
+                eta_min=0
+            )
 
-        # optimizer = LARSWrapper(Adam(parameters, lr=self.hparams.lr))
-        optimizer = Adam(parameters, lr=self.hparams.lr)
-        
-        # Trick 2 (after each step)
-        self.hparams.warmup_epochs = self.hparams.warmup_epochs * self.train_iters_per_epoch
-        max_epochs = self.trainer.max_epochs * self.train_iters_per_epoch
+            scheduler = {
+                'scheduler': linear_warmup_cosine_decay,
+                'interval': 'step',
+                'frequency': 1
+            }
+            return [optimizer], [scheduler]
 
-        linear_warmup_cosine_decay = LinearWarmupCosineAnnealingLR(
-            optimizer,
-            warmup_epochs=self.hparams.warmup_epochs,
-            max_epochs=max_epochs,
-            warmup_start_lr=0,
-            eta_min=0
-        )
-
-        scheduler = {
-            'scheduler': linear_warmup_cosine_decay,
-            'interval': 'step',
-            'frequency': 1
-        }
-
-        return [optimizer], [scheduler]
+        # else: optimizer_name == SGD
+        # weight_decay = self.hparams.opt_weight_decay??
+        optimizer = SGD(parameters, lr=self.hparams.lr, weight_decay=0.0)
+        return [optimizer], []
 
     def exclude_from_wt_decay(self, named_params, weight_decay, skip_list=['bias', 'bn']):
         params = []
@@ -315,6 +310,7 @@ class CustomSimCLR(pl.LightningModule):
 
         log = {"val/val_loss": val_loss, "val/val_acc": val_acc}
         self.logger.experiment.add_scalar("val/val_loss", val_loss, self.epoch)
+        self.log("val/val_loss", val_loss)
         self.logger.experiment.add_scalar("val/val_acc", val_acc, self.epoch)
         results = {"val_loss": val_loss, "val_acc": val_acc}
         results["log"] = results["progress_bar"] = log
@@ -348,7 +344,7 @@ def parse_args(parent_parser):
                         default=["GaussianNoise", "ChannelResize", "RandomResizedCrop", "Normalize"])
     # GaussianNoise
     parser.add_argument(
-            '--gaussian_scale', help='std param for gaussian noise transformation', default=0.005, type=float)
+            '--gaussian_scale', help='std param for gaussian noise transformation', default=0.01, type=float) # 0.005 original default
     # RandomResizedCrop
     parser.add_argument('--rr_crop_ratio_range',
                             help='ratio range for random resized crop transformation', default=[0.5, 1.0], type=float)
@@ -393,11 +389,11 @@ def parse_args(parent_parser):
     parser.add_argument('--out_dim', type=int, help="output dimension of model")
     parser.add_argument('--filter_cinc', default=False, action="store_true", help="only valid if cinc is selected: filter out the ptb data")
     parser.add_argument('--base_model')
-    parser.add_argument('--lin_params_use_batch_size', default=False,
-                        help='overparameterize as a function of batch_size')
     parser.add_argument('--ftr_multiplier', default=1, type=int,
                         help='Amount to multiply number of training samples by to define number of features.')
     parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for ')
+    parser.add_argument('--optimizer_name', type=str, default="Adam",
+                        choices=["Adam", "SGD"], help='Optimizer to use.')
     parser.add_argument('--force_linear_projection', type=bool, default=False,
                         help='OneLayerLinear models only: use linear w/ no hidden layers.')
     parser.add_argument('--widen',type=int, help="use wide xresnet1d50")
@@ -443,6 +439,7 @@ def pretrain_routine(args):
     else: # OneLayerLinear
         config["model"]["input_size"] = np.product(eval(config["dataset"]["input_shape"]))
         config["model"]["activation"] = args.activation if args.activation is not None else "F.relu"
+    config["optimizer_name"] = args.optimizer_name if args.optimizer_name is not None else "Adam" # "SGD"
     if args.out_dim is not None:
         config["model"]["out_dim"] = args.out_dim
     init_logger(config)
@@ -469,7 +466,6 @@ def pretrain_routine(args):
 def aftertrain_routine(config, args, trainer, pl_model, datamodule, callbacks):
     scores = {}
     for ca in callbacks:
-        import ipdb; ipdb.set_trace()
         if isinstance(ca, SSLOnlineEvaluator):
             scores[str(ca)] = {"macro": ca.best_macro}
 
@@ -498,13 +494,13 @@ def cli_main():
     # data
     ecg_datamodule = ECGDataModule(config, transformations, t_params, ptb_num_classes=ptb_num_classes)
     if args.base_model == 'OneLayerLinear':
-        if args.lin_params_use_batch_size:
-            config["model"]["num_ftrs"] = config["batch_size"] * args.ftr_multiplier
-        else:
-            config["model"]["num_ftrs"] = ecg_datamodule.num_samples * args.ftr_multiplier
         if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
             config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
+        config["model"]["num_ftrs"] = ecg_datamodule.num_samples**4 / config["model"]["input_size"]**3
+        config["model"]["num_ftrs"] *= args.ftr_multiplier
+        config["model"]["num_ftrs"] = int(config["model"]["num_ftrs"])
 
+    # callbacks = [EarlyStopping(monitor="val/val_loss", mode="min")]
     callbacks = []
     if args.run_callbacks:
             # callback for online linear evaluation/fine-tuning
@@ -530,10 +526,10 @@ def cli_main():
             config["model"]["out_dim"], activation=eval(config["model"]["activation"]))
     else:
         model = ResNetSimCLR(**config["model"])
-    # import ipdb; ipdb.set_trace()
+
     pl_model = CustomSimCLR(
             config["batch_size"], ecg_datamodule.num_samples, warmup_epochs=config["warm_up"], lr=config["lr"],
-            out_dim=config["model"]["out_dim"], config=config,
+            out_dim=config["model"]["out_dim"], config=config, optimizer_name=config["optimizer_name"],
             transformations=ecg_datamodule.transformations, loss_temperature=config["loss"]["temperature"], weight_decay=eval(config["weight_decay"]))
     pl_model.encoder = model # Even though the model has a projection
     if args.base_model == 'OneLayerLinear' and args.force_linear_projection:
