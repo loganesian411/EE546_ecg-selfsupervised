@@ -392,7 +392,7 @@ def parse_args(parent_parser):
     parser.add_argument('--base_model')
     parser.add_argument('--ftr_multiplier', default=1, type=float,
                         help='Amount to multiply number of training samples by to define number of features.')
-    parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for ')
+    parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for linear models.')
     parser.add_argument('--optimizer_name', type=str, default="Adam",
                         choices=["Adam", "SGD"], help='Optimizer to use.')
     parser.add_argument('--force_linear_projection', type=bool, default=False,
@@ -400,6 +400,7 @@ def parse_args(parent_parser):
     parser.add_argument('--widen',type=int, help="use wide xresnet1d50")
     parser.add_argument('--run_callbacks', default=False, action="store_true", help="run callbacks which asses linear evaluaton and finetuning metrics during pretraining")
     parser.add_argument('--early_stopping', default=False, action="store_true", help="enable early stopping based on validation cross entropy loss")
+    parser.add_argument('--best_model_ckpt', default=True, action="store_true", help="enable best model chkpt saving")
     parser.add_argument('--checkpoint_path', default="")
     return parser
 
@@ -505,6 +506,7 @@ def cli_main():
     callbacks = []
     if args.early_stopping:
         callbacks.append(EarlyStopping(monitor="val/val_loss", mode="min"))
+    if args.best_model_ckpt:
         callbacks.append(ModelCheckpoint(
             dirpath=os.path.join(config["log_dir"], "checkpoints"),
             monitor="val/val_loss", mode="min", save_top_k=1, save_last=True))
