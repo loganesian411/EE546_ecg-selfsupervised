@@ -22,7 +22,7 @@ loss:
 
 dataset:
   s: 1
-  input_shape: (12, 333) # (12, 250) # (12, 333) #(96,96,3)
+  input_shape: (12, 250) # (12, 250) # (12, 333) #(96,96,3)
   num_workers: 0
   valid_size: 0.05 # not used as far as I can tell.
   data_folder:    "./ecg_data_processed/ptb_xl_fs100"  # "./data/cinc_fs100"
@@ -30,7 +30,7 @@ dataset:
   target_fs: 100
   recreate_data_ptb_xl: False
   filter_cinc: False
-  ptb_xl_label: "label_diag_subclass" # "label_diag_superclass" # see below for all the options.
+  ptb_xl_label: "label_diag_superclass" # see below for all the options.
   
 
 eval_epochs: 50 # number of epochs to run online eval.
@@ -53,7 +53,7 @@ eval_dataset:
   target_folders: ["./ecg_data_processed/ptb_xl_fs100"]
   target_fs: 100
   recreate_data_ptb_xl: False
-  ptb_xl_label: "label_diag_subclass" # "label_diag_superclass"
+  ptb_xl_label: "label_diag_superclass"
     #------V------
     # label_all 71
     # label_diag 44

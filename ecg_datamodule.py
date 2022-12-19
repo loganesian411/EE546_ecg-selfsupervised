@@ -19,6 +19,8 @@ class ECGDataModule(LightningDataModule):
             config,
             transformations_str,
             t_params, 
+            dims: tuple = (12, 250),
+            ptb_num_classes: int = 5,
             data_dir: str = None,
             val_split: int = 5000,
             num_workers: int = 16,
@@ -29,17 +31,12 @@ class ECGDataModule(LightningDataModule):
     ):
         super().__init__(*args, **kwargs)
 
-        self.dims = (12, 250)
-        # self.val_split = val_split
+        self.dims = dims
+        self.ptb_num_classes = ptb_num_classes
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.seed = seed
         self.data_dir = data_dir if data_dir is not None else os.getcwd()
-        # self.num_samples = 60000 - val_split
-
-        # self.DATASET = SimCLRDataSetWrapper(
-        #    config['eval_batch_size'], **config['eval_dataset'])
-        # self.train_loader, self.valid_loader = self.DATASET.get_data_loaders()
         self.config = config
         self.transformations_str = transformations_str
         self.t_params = t_params
@@ -51,13 +48,10 @@ class ECGDataModule(LightningDataModule):
         train_loader, valid_loader = dataset.get_data_loaders() 
         self.num_samples = dataset.train_ds_size
         self.transformations = dataset.transformations
+    
     @property
     def num_classes(self):
-        """
-        Return:
-            10
-        """
-        return 5
+        return self.ptb_num_classes
 
     def prepare_data(self):
         pass
@@ -69,6 +63,8 @@ class ECGDataModule(LightningDataModule):
         return train_loader
 
     def val_dataloader(self):
+        # Returns three dataloaders. First is for the self-supervised training,
+        # the rest for linear evaluation.
         dataset = SimCLRDataSetWrapper(
             self.config['eval_batch_size'], **self.config['eval_dataset'], transformations=self.transformations_str, t_params=self.t_params)
         _, valid_loader_self = dataset.get_data_loaders()
@@ -77,7 +73,6 @@ class ECGDataModule(LightningDataModule):
         valid_loader_sup, test_loader_sup = dataset.get_data_loaders()
         # return valid_loader
         return [valid_loader_self, valid_loader_sup, test_loader_sup]
-
 
     def test_dataloader(self):
         return self.valid_loader

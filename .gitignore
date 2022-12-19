@@ -4,6 +4,8 @@ ecg-selfsupervised/clinical_ts/__pycache__/
 ecg-selfsupervised/ecg_data/
 ecg-selfsupervised/ecg_data_processed/
 
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

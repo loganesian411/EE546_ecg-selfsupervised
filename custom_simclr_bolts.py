@@ -1,45 +1,38 @@
-import pytorch_lightning as pl
-# from pl_bolts.models.self_supervised import SimCLR
-from pl_bolts.optimizers.lars_scheduling import LARSWrapper
-from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-from torch.optim import Adam
-import torch
-import re
-import pdb 
-
-import math
 from argparse import ArgumentParser
-from typing import Callable, Optional
-
-import numpy as np
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from pytorch_lightning.utilities import AMPType
-from torch import nn
-from torch.optim.optimizer import Optimizer
-
-
-from models.resnet_simclr import ResNetSimCLR
-import re
-
-import time
-import pickle
-import yaml
-import logging
-import os
 from clinical_ts.simclr_dataset_wrapper import SimCLRDataSetWrapper
 from clinical_ts.create_logger import create_logger
-import pickle
-from pytorch_lightning import Trainer, seed_everything
-
-from torch import nn
-from torch.nn import functional as F
-from online_evaluator import SSLOnlineEvaluator
 from ecg_datamodule import ECGDataModule
-from pytorch_lightning.loggers import TensorBoardLogger
-from pl_bolts.models.self_supervised.evaluator import Flatten
+import logging
+import math
+from models.resnet_simclr import ResNetSimCLR
+from models.onelayer_linear import OneLayerLinear
+import numpy as np
+from online_evaluator import SSLOnlineEvaluator
+import os
 import pdb
+import pickle
+from pl_bolts.models.self_supervised.evaluator import Flatten
+from pl_bolts.optimizers.lars_scheduling import LARSWrapper
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.utilities import AMPType
+import re
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from torch.optim import Adam, SGD
+import torch
+from torch import nn
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.optim.optimizer import Optimizer
+import time
+from typing import Callable, Optional
+import yaml
+
 method="simclr"
 logger = create_logger(__name__)
 def _accuracy(zis, zjs, batch_size):
@@ -59,7 +52,13 @@ def _accuracy(zis, zjs, batch_size):
 def mean(res, key1, key2=None):
     if key2 is not None:
         return torch.stack([x[key1][key2] for x in res]).mean()
-    return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()]).mean()
+    return stack(res, key1).mean()
+
+def stack(res, key1):
+    return torch.stack([x[key1] for x in res if type(x) == dict and key1 in x.keys()])
+
+def cat(res, key1):
+    return torch.cat([x[key1] for x in res if type(x) == dict and key1 in x.keys()], 0)
 
 class Projection(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=2048, output_dim=128):
@@ -67,13 +66,18 @@ class Projection(nn.Module):
         self.output_dim = output_dim
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.model = nn.Sequential(
-            # nn.AdaptiveAvgPool2d((1, 1)),
-            Flatten(),
-            nn.Linear(self.input_dim, self.hidden_dim, bias=True),
-            # nn.BatchNorm1d(self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.output_dim, bias=True))
+        if hidden_dim:
+            self.model = nn.Sequential(
+                # nn.AdaptiveAvgPool2d((1, 1)),
+                Flatten(),
+                nn.Linear(self.input_dim, self.hidden_dim, bias=True),
+                # nn.BatchNorm1d(self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, self.output_dim, bias=True))
+        else:
+            self.model = nn.Sequential(
+                Flatten(),
+                nn.Linear(self.input_dim, self.output_dim, bias=True))
 
     def forward(self, x):
         x = self.model(x)
@@ -113,6 +117,8 @@ class CustomSimCLR(pl.LightningModule):
                  loss_temperature=0.5,
                  config=None,
                  transformations=None,
+                 cls_normalizer=None, # None | "std" | "norm"
+                 optimizer_name='Adam',
                  **kwargs):
         """
         Args:
@@ -130,42 +136,48 @@ class CustomSimCLR(pl.LightningModule):
         self.epoch = 0
         self.batch_size = batch_size
         self.num_samples = num_samples
+        self.cls_normalizer = cls_normalizer
+        self.optimizer_name = optimizer_name
         self.save_hyperparameters()
-        # pdb.set_trace()
 
     def configure_optimizers(self):
-        global_batch_size = self.trainer.world_size * self.hparams.batch_size
-        self.train_iters_per_epoch = self.hparams.num_samples // global_batch_size
         # TRICK 1 (Use lars + filter weights)
         # exclude certain parameters
         parameters = self.exclude_from_wt_decay(
             self.named_parameters(),
             weight_decay=self.hparams.opt_weight_decay
         )
+        if self.optimizer_name == 'Adam':
+            global_batch_size = self.trainer.world_size * self.hparams.batch_size
+            self.train_iters_per_epoch = self.hparams.num_samples // global_batch_size
+            
+            # optimizer = LARSWrapper(Adam(parameters, lr=self.hparams.lr))
+            optimizer = Adam(parameters, lr=self.hparams.lr)
+            
+            # Trick 2 (after each step)
+            self.hparams.warmup_epochs = self.hparams.warmup_epochs * self.train_iters_per_epoch
+            max_epochs = self.trainer.max_epochs * self.train_iters_per_epoch
 
+            # TODO(loganesian): Enable different scheduler for linear model.
+            linear_warmup_cosine_decay = LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.hparams.warmup_epochs,
+                max_epochs=max_epochs,
+                warmup_start_lr=0,
+                eta_min=0
+            )
 
-        # optimizer = LARSWrapper(Adam(parameters, lr=self.hparams.lr))
-        optimizer = Adam(parameters, lr=self.hparams.lr)
-        
-        # Trick 2 (after each step)
-        self.hparams.warmup_epochs = self.hparams.warmup_epochs * self.train_iters_per_epoch
-        max_epochs = self.trainer.max_epochs * self.train_iters_per_epoch
+            scheduler = {
+                'scheduler': linear_warmup_cosine_decay,
+                'interval': 'step',
+                'frequency': 1
+            }
+            return [optimizer], [scheduler]
 
-        linear_warmup_cosine_decay = LinearWarmupCosineAnnealingLR(
-            optimizer,
-            warmup_epochs=self.hparams.warmup_epochs,
-            max_epochs=max_epochs,
-            warmup_start_lr=0,
-            eta_min=0
-        )
-
-        scheduler = {
-            'scheduler': linear_warmup_cosine_decay,
-            'interval': 'step',
-            'frequency': 1
-        }
-
-        return [optimizer], [scheduler]
+        # else: optimizer_name == SGD
+        # weight_decay = self.hparams.opt_weight_decay??
+        optimizer = SGD(parameters, lr=self.hparams.lr, weight_decay=0.0)
+        return [optimizer], []
 
     def exclude_from_wt_decay(self, named_params, weight_decay, skip_list=['bias', 'bn']):
         params = []
@@ -248,45 +260,6 @@ class CustomSimCLR(pl.LightningModule):
 
         return loss
 
-    def training_step(self, batch, batch_idx):
-        z1, z2 = self.shared_forward(batch, batch_idx)
-        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
-        # result = pl.TrainResult(minimize=loss)
-        # result.log('train/train_loss', loss, on_epoch=True)
-
-        acc = _accuracy(z1, z2, z1.shape[0])
-        # result.log('train/train_acc', acc, on_epoch=True)
-        result = {
-            "train/train_loss": loss, 
-            "minimize":loss,
-            "train/train_acc" : acc,
-        }
-        return loss
-
-    def validation_step(self, batch, batch_idx, dataloader_idx):
-        if dataloader_idx != 0:
-            return {}
-        z1, z2 = self.shared_forward(batch, batch_idx)
-        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
-
-        acc = _accuracy(z1, z2, z1.shape[0])
-        results = {
-            'val_loss': loss,
-            'val_acc': torch.tensor(acc)
-        }
-        return results
-
-    def validation_epoch_end(self, outputs):
-        # outputs[0] because we are using multiple datasets!
-        val_loss = mean(outputs[0], 'val_loss')
-        val_acc = mean(outputs[0], 'val_acc')
-
-        log = {
-            'val/val_loss': val_loss,
-            'val/val_acc': val_acc
-        }
-        return {'val_loss': val_loss, 'log': log, 'progress_bar': log}
-
     def on_train_start(self):
         # log configuration
         config_str = re.sub(r"[,\}\{]", "<br/>", str(self.config))
@@ -300,11 +273,55 @@ class CustomSimCLR(pl.LightningModule):
             transformation_str), global_step=0)
         self.epoch = 0
 
-    def on_epoch_end(self):
+    def training_step(self, batch, batch_idx):
+        z1, z2 = self.shared_forward(batch, batch_idx)
+        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
+        acc = _accuracy(z1, z2, z1.shape[0])
+        result = {
+            "loss": loss,
+            "acc" : acc,
+        }
+        return result
+
+    def training_epoch_end(self, outputs):
+        avg_loss = torch.stack([x["loss"] for x in outputs]).mean()
+        avg_acc = torch.stack([x["acc"] for x in outputs]).mean()
+
+        log = {"train/train_loss": avg_loss, "train/train_acc": avg_acc}
+        self.logger.experiment.add_scalar("train/train_loss", avg_loss, self.epoch)
+        self.logger.experiment.add_scalar("train/train_acc", avg_acc, self.epoch)
+
+    def on_train_epoch_end(self):
         self.epoch += 1
 
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        results = {}
+        if dataloader_idx != 0: return results
+        z1, z2 = self.shared_forward(batch, batch_idx)
+        loss = self.nt_xent_loss(z1, z2, self.hparams.loss_temperature)
+        acc = _accuracy(z1, z2, z1.shape[0])
+        results["val_loss"] = loss
+        results["val_acc"] = torch.tensor(acc)
+        return results
+
+    def validation_epoch_end(self, outputs):
+        # outputs[0] because we are using multiple datasets!
+        val_loss = mean(outputs[0], "val_loss")
+        val_acc = mean(outputs[0], "val_acc")
+
+        log = {"val/val_loss": val_loss, "val/val_acc": val_acc}
+        self.logger.experiment.add_scalar("val/val_loss", val_loss, self.epoch)
+        self.log("val/val_loss", val_loss)
+        self.logger.experiment.add_scalar("val/val_acc", val_acc, self.epoch)
+        results = {"val_loss": val_loss, "val_acc": val_acc}
+        results["log"] = results["progress_bar"] = log
+        return results
+
     def type(self):
-        return self.encoder.features[0][0].weight.type()
+        if hasattr(self.encoder, 'features'):
+            return self.encoder.features[0][0].weight.type()
+        else:
+            return self.encoder.l1.weight.type()
 
     def get_representations(self, x):
         return self.encoder(x)[0]
@@ -313,19 +330,22 @@ class CustomSimCLR(pl.LightningModule):
         return self.encoder
 
     def get_device(self):
-        return self.encoder.features[0][0].weight.device
+        if hasattr(self.encoder, 'features'):
+            return self.encoder.features[0][0].weight.device
+        else:
+            return self.encoder.l1.weight.device
 
     def to_device(self, x):
         return x.type(self.type()).to(self.get_device())
 
-
 def parse_args(parent_parser):
     parser = ArgumentParser(parents=[parent_parser], add_help=False)
+    parser.add_argument('--config_name', default='bolts_config.yaml')
     parser.add_argument('-t', '--trafos', nargs='+', help='add transformation to data augmentation pipeline',
-                        default=["GaussianNoise", "ChannelResize", "RandomResizedCrop"])
+                        default=["GaussianNoise", "ChannelResize", "RandomResizedCrop", "Normalize"])
     # GaussianNoise
     parser.add_argument(
-            '--gaussian_scale', help='std param for gaussian noise transformation', default=0.005, type=float)
+            '--gaussian_scale', help='std param for gaussian noise transformation', default=0.01, type=float) # 0.005 original default
     # RandomResizedCrop
     parser.add_argument('--rr_crop_ratio_range',
                             help='ratio range for random resized crop transformation', default=[0.5, 1.0], type=float)
@@ -370,8 +390,17 @@ def parse_args(parent_parser):
     parser.add_argument('--out_dim', type=int, help="output dimension of model")
     parser.add_argument('--filter_cinc', default=False, action="store_true", help="only valid if cinc is selected: filter out the ptb data")
     parser.add_argument('--base_model')
+    parser.add_argument('--ftr_multiplier', default=1, type=float,
+                        help='Amount to multiply number of training samples by to define number of features.')
+    parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for linear models.')
+    parser.add_argument('--optimizer_name', type=str, default="Adam",
+                        choices=["Adam", "SGD"], help='Optimizer to use.')
+    parser.add_argument('--force_linear_projection', type=bool, default=False,
+                        help='OneLayerLinear models only: use linear w/ no hidden layers.')
     parser.add_argument('--widen',type=int, help="use wide xresnet1d50")
     parser.add_argument('--run_callbacks', default=False, action="store_true", help="run callbacks which asses linear evaluaton and finetuning metrics during pretraining")
+    parser.add_argument('--early_stopping', default=False, action="store_true", help="enable early stopping based on validation cross entropy loss")
+    parser.add_argument('--best_model_ckpt', default=True, action="store_true", help="enable best model chkpt saving")
     parser.add_argument('--checkpoint_path', default="")
     return parser
 
@@ -395,9 +424,9 @@ def pretrain_routine(args):
                 "epsilon": args.epsilon, "magnitude_range": args.magnitude_range, "downsample_ratio": args.downsample_ratio, "to_crop_ratio_range": args.to_crop_ratio_range,
                 "bw_cmax":0.1, "em_cmax":0.5, "pl_cmax":0.2, "bs_cmax":1}
     transformations = args.trafos
-    checkpoint_config = os.path.join("checkpoints", "bolts_config.yaml")
+    checkpoint_config = os.path.join("checkpoints", args.config_name)
     config_file = checkpoint_config if args.resume and os.path.isfile(
-        checkpoint_config) else "bolts_config.yaml"
+        checkpoint_config) else args.config_name
     config = yaml.load(open(config_file, "r"), Loader=yaml.FullLoader)
     args_dict = vars(args)
     for key in set(config.keys()).union(set(args_dict.keys())):
@@ -407,8 +436,13 @@ def pretrain_routine(args):
         config["dataset"]["target_folders"] = args.target_folders
     config["dataset"]["percentage"] = args.percentage if args.percentage is not None else config["dataset"]["percentage"]
     config["dataset"]["filter_cinc"] = args.filter_cinc if args.filter_cinc is not None else config["dataset"]["filter_cinc"]
-    config["model"]["base_model"] = args.base_model if args.base_model is not None else config["model"]["base_model"]
-    config["model"]["widen"] = args.widen if args.widen is not None else config["model"]["widen"]
+    if args.base_model != 'OneLayerLinear': # resnet flavors
+        config["model"]["base_model"] = args.base_model if args.base_model is not None else config["model"]["base_model"]
+        config["model"]["widen"] = args.widen if args.widen is not None else config["model"]["widen"]
+    else: # OneLayerLinear
+        config["model"]["input_size"] = np.product(eval(config["dataset"]["input_shape"]))
+        config["model"]["activation"] = args.activation if args.activation is not None else "F.relu"
+    config["optimizer_name"] = args.optimizer_name if args.optimizer_name is not None else "Adam" # "SGD"
     if args.out_dim is not None:
         config["model"]["out_dim"] = args.out_dim
     init_logger(config)
@@ -420,15 +454,14 @@ def pretrain_routine(args):
     date = time.asctime()
     label_to_num_classes = {"label_all": 71, "label_diag": 44, "label_form": 19,
                             "label_rhythm": 12, "label_diag_subclass": 23, "label_diag_superclass": 5}
-    ptb_num_classes = label_to_num_classes[config["eval_dataset"]
-                                           ["ptb_xl_label"]]
+    ptb_num_classes = label_to_num_classes[config["eval_dataset"]["ptb_xl_label"]]
     abr = {"Transpose": "Tr", "TimeOut": "TO", "DynamicTimeWarp": "DTW", "RandomResizedCrop": "RRC", "ChannelResize": "ChR", "GaussianNoise": "GN",
            "TimeWarp": "TW", "ToTensor": "TT", "GaussianBlur": "GB", "BaselineWander": "BlW", "PowerlineNoise": "PlN", "EMNoise": "EM", "BaselineShift": "BlS"}
     trs = re.sub(r"[,'\]\[]", "", str([abr[str(tr)] if abr[str(tr)] not in [
                  "TT", "Tr"] else '' for tr in dataset.transformations]))
     name = str(date) + "_" + method + "_" + str(
         time.time_ns())[-3:] + "_" + trs[1:]
-    tb_logger = TensorBoardLogger(args.log_dir, name=name, version='')
+    tb_logger = TensorBoardLogger(args.log_dir, name=name, version='', log_graph=True)
     config["log_dir"] = os.path.join(args.log_dir, name)
     print(config)
     return config, dataset, date, transformations, t_params, ptb_num_classes, tb_logger
@@ -462,32 +495,58 @@ def cli_main():
     config, dataset, date, transformations, t_params, ptb_num_classes, tb_logger = pretrain_routine(args)
 
     # data
-    ecg_datamodule = ECGDataModule(config, transformations, t_params)
+    ecg_datamodule = ECGDataModule(config, transformations, t_params, ptb_num_classes=ptb_num_classes)
+    if args.base_model == 'OneLayerLinear':
+        if args.output_size > 0 and 'RandomResizedCrop' in args.trafos:
+            config["model"]["input_size"] = eval(config["dataset"]["input_shape"])[0] * args.output_size
+        config["model"]["num_ftrs"] = ecg_datamodule.num_samples**4 / config["model"]["input_size"]**3
+        config["model"]["num_ftrs"] *= args.ftr_multiplier
+        config["model"]["num_ftrs"] = int(config["model"]["num_ftrs"])
 
     callbacks = []
+    if args.early_stopping:
+        callbacks.append(EarlyStopping(monitor="val/val_loss", mode="min"))
+    if args.best_model_ckpt:
+        callbacks.append(ModelCheckpoint(
+            dirpath=os.path.join(config["log_dir"], "checkpoints"),
+            monitor="val/val_loss", mode="min", save_top_k=1, save_last=True))
     if args.run_callbacks:
-            # callback for online linear evaluation/fine-tuning
-        linear_evaluator = SSLOnlineEvaluator(drop_p=0,
-                                          z_dim=512, num_classes=ptb_num_classes, hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"], mode="linear_evaluation", verbose=False)
+        # callback for online linear evaluation/fine-tuning
+        linear_evaluator = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
+            hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
+            mode="linear_evaluation", verbose=True)
 
-        fine_tuner = SSLOnlineEvaluator(drop_p=0,
-                                          z_dim=512, num_classes=ptb_num_classes, hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"], mode="fine_tuning", verbose=False)
+        # TODO(loganesian): wrap in a flag.
+        # fine_tuner = SSLOnlineEvaluator(drop_p=0, z_dim=512, num_classes=ptb_num_classes,
+        #     hidden_dim=None, lin_eval_epochs=config["eval_epochs"], eval_every=config["eval_every"],
+        #     mode="fine_tuning", verbose=False)
    
         callbacks.append(linear_evaluator)
-        callbacks.append(fine_tuner)
+        # callbacks.append(fine_tuner) # TOOD(loganesian): wrap in a flag.
 
-    # configure trainer
     trainer = Trainer(logger=tb_logger, max_epochs=config["epochs"], gpus=args.gpus, # distributed_backend=args.distributed_backend,
-                      auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks)
+                      auto_lr_find=False, num_nodes=args.num_nodes, precision=config["precision"], callbacks=callbacks,
+                      log_every_n_steps=1)
 
     # pytorch lightning module
-    model = ResNetSimCLR(**config["model"])
+    if args.base_model == "OneLayerLinear":
+        # hardcoding 512 to match the dimensionality of the features learned with resnet model
+        # the only parameter we will vary is the number of hidden units.
+        model = OneLayerLinear(config["model"]["input_size"], config["model"]["num_ftrs"],
+            512, activation=eval(config["model"]["activation"]))
+    else:
+        model = ResNetSimCLR(**config["model"])
+
     pl_model = CustomSimCLR(
             config["batch_size"], ecg_datamodule.num_samples, warmup_epochs=config["warm_up"], lr=config["lr"],
-            out_dim=config["model"]["out_dim"], config=config,
+            out_dim=config["model"]["out_dim"], config=config, optimizer_name=config["optimizer_name"],
             transformations=ecg_datamodule.transformations, loss_temperature=config["loss"]["temperature"], weight_decay=eval(config["weight_decay"]))
-    pl_model.encoder = model
-    pl_model.projection = Projection(
+    pl_model.encoder = model # Even though the model has a projection
+    if args.base_model == 'OneLayerLinear' and args.force_linear_projection:
+        pl_model.projection = Projection(
+            input_dim=model.l1.in_features, hidden_dim=None, output_dim=config["model"]["out_dim"])
+    else:
+        pl_model.projection = Projection(
             input_dim=model.l1.in_features, hidden_dim=512, output_dim=config["model"]["out_dim"])
 
     # load checkpoint
@@ -499,7 +558,7 @@ def cli_main():
             raise("checkpoint does not exist")
 
     # start training
-    trainer.fit(pl_model, ecg_datamodule)
+    trainer.fit(pl_model, datamodule=ecg_datamodule)
 
     aftertrain_routine(config, args, trainer, pl_model, ecg_datamodule, callbacks)
 

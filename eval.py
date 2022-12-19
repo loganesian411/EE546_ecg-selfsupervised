@@ -8,9 +8,11 @@ import sys
 import csv
 import argparse
 import pickle
+from models.onelayer_linear import OneLayerLinear
 from models.resnet_simclr import ResNetSimCLR
 from clinical_ts.cpc import CPCModel
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,17 +25,26 @@ from clinical_ts.timeseries_utils import aggregate_predictions
 import pdb
 from copy import deepcopy
 from os.path import join, isdir
+import ipdb
+from torchviz import make_dot
+
+#Command: python eval.py --method simclr --use_pretrained --l_epochs 50 --linear_evaluation 
+# --model_file "./experiment_logs/Tue Nov 15 00:01:44 2022_simclr_000_RRC TO /checkpoints/model.ckpt"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+label_to_num_classes = {"label_all": 71, "label_diag": 44, "label_form": 19,
+    "label_rhythm": 12, "label_diag_subclass": 23, "label_diag_superclass": 5}
 
 def parse_args():
     parser = argparse.ArgumentParser("Finetuning tests")
-    parser.add_argument("--model_file")
+    parser.add_argument("--model_file", type=str)
     parser.add_argument("--method")
-    parser.add_argument("--dataset", nargs="+", default="./data/ptb_xl_fs100")
+    parser.add_argument("--eval_datapath", nargs="+", default="./ecg_data_processed/ptb_xl_fs100")
     parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument('--optimizer_name', type=str, default="Adam",
+                        choices=["Adam", "SGD"], help='Optimizer to use.')
     parser.add_argument("--discriminative_lr", default=False, action="store_true")
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--hidden", default=False, action="store_true")
     parser.add_argument("--lr_schedule", default="{}")
     parser.add_argument("--use_pretrained", default=False, action="store_true")
@@ -48,7 +59,8 @@ def parse_args():
     parser.add_argument("--test", action="store_true", default=False)
     parser.add_argument("--verbose", action="store_true", default=False)
     parser.add_argument("--cpc", action="store_true", default=False)
-    parser.add_argument("--model_location")
+    parser.add_argument("--model_location", type=str)
+    parser.add_argument("--ptb_xl_label", type=str, default="label_all", choices=list(label_to_num_classes.keys()))
     parser.add_argument("--l_epochs", type=int, default=0, help="number of head-only epochs (these are performed first)")
     parser.add_argument("--f_epochs", type=int, default=0, help="number of finetuning epochs (these are perfomed after head-only training")
     parser.add_argument("--normalize", action="store_true", default=False, help="normalize dataset with ptbxl mean and std")
@@ -57,11 +69,18 @@ def parse_args():
     parser.add_argument("--conv_encoder", action="store_true", default=False)
     parser.add_argument("--base_model", default="xresnet1d50")
     parser.add_argument("--widen", default=1, type=int, help="use wide xresnet1d50")
+    parser.add_argument("--head_only_epochs", type=int, default=0, help="how many epochs to only train the linear head")
+    parser.add_argument("--config_name", type=str, default= "./experiment_configs/resnet_randomcrop_config.yaml")
+    parser.add_argument('--lin_hidden_size', default=261, type=int,
+        help='Number of parameters in hidden layer of linear encoder.')
+    parser.add_argument('--activation', type=str, default="F.relu", help='Optional activation for linear models.')
+    parser.add_argument('--out_dim', type=int, help="output dimension of model")
+    parser.add_argument("--visualize", type=bool, default=False)
     args = parser.parse_args()
     return args
 
 
-def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
+def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr", base_model="xresnet1d50"):
     # in case of moco model
     from collections import OrderedDict
     # lightning_state_dict = lightning_state_dict["state_dict"]
@@ -74,8 +93,12 @@ def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
                     new_state_dict[key] = lightning_state_dict[l_key]
         elif method == "simclr":
             for key in init_state_dict:
-                if "features" in key:
-                    l_key = key.replace("features", "encoder.features")
+                if base_model != "linear":
+                    if "features" in key:
+                        l_key = key.replace("features", "encoder.features")
+                else: # linear
+                    if "encoder" in key:
+                        l_key = key.replace("encoder", "encoder.encoder")
                 if l_key in lightning_state_dict.keys():
                     new_state_dict[key] = lightning_state_dict[l_key]
         elif method == "swav":
@@ -99,7 +122,7 @@ def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
             new_state_dict["l2.bias"] = init_state_dict["l2.bias"]
 
         assert(len(init_state_dict) == len(new_state_dict))
-    else:
+    else: # cpc
         for key in init_state_dict:
             l_key = "model_cpc." + key
             if l_key in lightning_state_dict.keys():
@@ -109,7 +132,10 @@ def get_new_state_dict(init_state_dict, lightning_state_dict, method="simclr"):
     return new_state_dict
 
 
-def adjust(model, num_classes, hidden=False):
+def adjust(model, num_classes, hidden=False, base_model="xresnet1d"):
+    if hidden and base_model == "linear":
+        raise NotImplementedError("Hidden not supported for linear models.")
+
     in_features = model.l1.in_features
     last_layer = torch.nn.modules.linear.Linear(
         in_features, num_classes).to(device)
@@ -120,24 +146,32 @@ def adjust(model, num_classes, hidden=False):
     else:
         model.l1 = last_layer
 
-    def def_forward(self):
-        def new_forward(x):
-            h = self.features(x)
-            h = h.squeeze()
+    if base_model != "linear":
+        def def_forward(self):
+            def new_forward(x):
+                h = self.features(x)
+                h = h.squeeze()
 
-            x = self.l1(h)
-            if hidden:
-                x = F.relu(x)
-                x = self.l2(x)
-            return x
-        return new_forward
+                x = self.l1(h)
+                if hidden:
+                    x = F.relu(x)
+                    x = self.l2(x)
+                return x
+            return new_forward
+    
+    else: # linear
+        def def_forward(self):
+            def new_forward(x):
+                h = self.encoder(self.flatten(x)).squeeze()
+                if self.activation is not None: h = self.activation(h)
+                return self.l1(h)
+            return new_forward
 
     model.forward = def_forward(model)
 
-
-def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer="adam", discriminative_lr_factor=1):
+def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer_name="adam", discriminative_lr_factor=1):
     loss_fn = F.binary_cross_entropy_with_logits
-    if base_model == "xresnet1d":
+    if "xresnet1d" in base_model:
         wd = 1e-1
         if head_only:
             lr = (8e-3*(batch_size/256))
@@ -187,9 +221,9 @@ def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=Fa
         print("batch size", batch_size)
 
     elif base_model == "cpc":
-        if(optimizer == "sgd"):
+        if(optimizer_name == "SGD"):
             opt = torch.optim.SGD
-        elif(optimizer == "adam"):
+        elif(optimizer_name == "Adam"):
             opt = torch.optim.AdamW
         else:
             raise NotImplementedError("Unknown Optimizer.")
@@ -208,12 +242,52 @@ def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=Fa
             lr = 1e-3
             print("normal supervised training")
             optimizer = opt(model.parameters(), lr, weight_decay=wd)
+
+    elif base_model == "linear":
+        wd = 1e-1
+        if head_only:
+            # 8e-3*(batch_size/256) = 0.016
+            lr = (8e-3*(batch_size/256)) # TODO(loganesian): Not sure where this is from.
+            # lr = 0.1
+            if optimizer_name == 'Adam':
+                optimizer = torch.optim.AdamW(model.l1.parameters(), lr=lr,
+                    weight_decay=wd)
+            else: # SGD
+                optimizer = torch.optim.SGD(model.l1.parameters(), lr=lr,
+                    weight_decay=wd)
+        else:
+            lr = 0.01
+            if optimizer_name == 'Adam':
+                optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                    weight_decay=wd)
+            else: # SGD
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr,
+                    weight_decay=wd)
+
     else:
         raise("model unknown")
     return loss_fn, optimizer
 
+def load_config(args):
+    config = yaml.load(open(args.config_name, "r"), Loader=yaml.FullLoader)
+
+    args_dict = vars(args)
+    for key in set(config.keys()).union(set(args_dict.keys())):
+        config[key] = config[key] if ((key not in args_dict.keys()) or (key in config.keys() and args_dict[key] is None)) else args_dict[key]
+
+    if args.base_model != 'linear': # resnet flavors
+        config["model"]["base_model"] = args.base_model if args.base_model is not None else config["model"]["base_model"]
+        config["model"]["widen"] = args.widen if args.widen is not None else config["model"]["widen"]
+    else: # linear
+        config["model"]["input_size"] = np.product(eval(config["eval_dataset"]["input_shape"]))
+        config["model"]["activation"] = args.activation if args.activation is not None else "F.relu"
+        config["model"]["num_ftrs"] = args.lin_hidden_size
+    
+    if args.out_dim is not None: config["model"]["out_dim"] = args.out_dim
+    return config
 
 def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr=False, hidden=False, conv_encoder=False, bn_head=False, ps_head=0.5, location="./checkpoints/moco_baselinewonder200.ckpt", method="simclr", base_model="xresnet1d50", out_dim=16, widen=1):
+    
     discriminative_lr_factor = 1
     if use_pretrained:
         print("load model from " + location)
@@ -241,16 +315,18 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
 
             model = CPCModel(input_channels=12, strides=strides, kss=kss, features=[512]*4, n_hidden=512, n_layers=2, mlp=False, lstm=True, bias_proj=False,
                              num_classes=num_classes, skip_encoder=False, bn_encoder=True, lin_ftrs_head=lin_ftrs_head, ps_head=ps_head, bn_head=bn_head).to(device)
-
+            
             if "state_dict" in lightning_state_dict.keys():
                 print("load pretrained model")
-                model_state_dict = get_new_state_dict(
-                    model.state_dict(), lightning_state_dict["state_dict"], method="cpc")
+                model_state_dict = get_new_state_dict(model.state_dict(),
+                    lightning_state_dict["state_dict"], method="cpc",
+                    base_model=base_model)
             else:
                 print("load already finetuned model")
                 model_state_dict = lightning_state_dict
             model.load_state_dict(model_state_dict)
-        else:
+        
+        elif "xresnet1d" in base_model:
             model = ResNetSimCLR(base_model, out_dim, hidden=hidden, widen=widen).to(device)
             model_state_dict = torch.load(location, map_location=device)
             if "state_dict" in model_state_dict.keys():
@@ -260,22 +336,47 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
                 if model_classes != num_classes:
                     raise Exception("Loaded model has different output dim ({}) than needed ({})".format(
                         model_classes, num_classes))
-                adjust(model, num_classes, hidden=hidden)
+                adjust(model, num_classes, hidden=hidden, base_model=base_model)
                 if not hidden and "l2.weight" in model_state_dict:
                     del model_state_dict["l2.weight"]
                     del model_state_dict["l2.bias"]
                 model.load_state_dict(model_state_dict)
             else:  # load pretrained model
                 base_dict = model.state_dict()
-                model_state_dict = get_new_state_dict(
-                    base_dict, model_state_dict, method=method)
+                model_state_dict = get_new_state_dict(base_dict, model_state_dict,
+                    method=method, base_model=base_model)
                 model.load_state_dict(model_state_dict)
-                adjust(model, num_classes, hidden=hidden)
+                adjust(model, num_classes, hidden=hidden, base_model=base_model)
+        
+        elif base_model == "linear":
+            # hardcoding 512 to match the dimensionality of the features learned with resnet model
+            # the only parameter we will vary is the number of hidden units.
+            model = OneLayerLinear(config["model"]["input_size"], config["model"]["num_ftrs"],
+                        512, activation=eval(config["model"]["activation"])).to(device)
+            model_state_dict = torch.load(location, map_location=device)
+            if "state_dict" in model_state_dict.keys():
+                model_state_dict = model_state_dict["state_dict"]
+            if "l1.weight" in model_state_dict.keys():  # load already fine-tuned model
+                model_classes = model_state_dict["l1.weight"].shape[0]
+                if model_classes != num_classes:
+                    raise Exception("Loaded model has different output dim ({}) than needed ({})".format(
+                        model_classes, num_classes))
+                adjust(model, num_classes, hidden=hidden, base_model=base_model)
+                if not hidden and "l2.weight" in model_state_dict: # shouldn't enter here for now.
+                    del model_state_dict["l2.weight"]
+                    del model_state_dict["l2.bias"]
+                model.load_state_dict(model_state_dict)
+            else:  # load pretrained model
+                base_dict = model.state_dict()
+                model_state_dict = get_new_state_dict(
+                    base_dict, model_state_dict, method=method, base_model=base_model)
+                model.load_state_dict(model_state_dict)
+                adjust(model, num_classes, hidden=hidden, base_model=base_model)
 
-    else:
+    else: # not use_pretrained (supervised training)
         if "xresnet1d" in base_model:
             model = ResNetSimCLR(base_model, out_dim, hidden=hidden, widen=widen).to(device)
-            adjust(model, num_classes, hidden=hidden)
+            adjust(model, num_classes, hidden=hidden, base_model=base_model)
         elif base_model == "cpc":
             if linear_evaluation:
                 lin_ftrs_head = []
@@ -299,12 +400,12 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
 
         else:
             raise Exception("model unknown")
-
     return model
 
 
-def evaluate(model, dataloader, idmap, lbl_itos, cpc=False):
-    preds, targs = eval_model(model, dataloader, cpc=cpc)
+def evaluate(model, dataloader, idmap, lbl_itos, base_model="xresnet1d", cpc=False):
+    
+    preds, targs = eval_model(model, dataloader, base_model=base_model, cpc=cpc)
     scores = eval_scores(targs, preds, classes=lbl_itos, parallel=True)
     preds_agg, targs_agg = aggregate_predictions(preds, targs, idmap)
     scores_agg = eval_scores(targs_agg, preds_agg,
@@ -313,10 +414,10 @@ def evaluate(model, dataloader, idmap, lbl_itos, cpc=False):
     macro_agg = scores_agg["label_AUC"]["macro"]
     return preds, macro, macro_agg
 
-
-def set_train_eval(model, cpc, linear_evaluation):
+# TODO(loganesian): add support for linear
+def set_train_eval(model, cpc, linear_evaluation, base_model="xresnet1d"):
     if linear_evaluation:
-        if cpc:
+        if cpc or base_model == "linear":
             model.encoder.eval()
         else:
             model.features.eval()
@@ -324,7 +425,8 @@ def set_train_eval(model, cpc, linear_evaluation):
         model.train()
 
 
-def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
+def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, writer, base_model="xresnet1d50", head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
+    
     if head_only:
         if linear_evaluation:
             print("linear evaluation for {} epochs".format(epochs))
@@ -344,10 +446,12 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             param.requires_grad = True
     if cpc:
         data_type = model.encoder[0][0].weight.type()
+    elif base_model == "linear":
+        data_type = model.encoder.weight.type()
     else:
         data_type = model.features[0][0].weight.type()
 
-    set_train_eval(model, cpc, linear_evaluation)
+    set_train_eval(model, cpc, linear_evaluation, base_model)
     state_dict_pre = deepcopy(model.state_dict())
     print("epoch", "batch", "loss\n========================")
     loss_per_epoch = []
@@ -360,6 +464,9 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
     best_preds = None
     test_macro = 0
     test_macro_agg = 0
+    #
+    images, labels = next(iter(train_loader))
+    # writer.add_graph(model,images)
     for epoch in tqdm(range(epochs)):
         if type(lr_schedule) == dict:
             if epoch in lr_schedule.keys():
@@ -378,15 +485,20 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             loss.backward()
             optimizer.step()
             total_loss_one_epoch += loss.item()
+            
             if(batch_idx % 100 == 0):
                 print(epoch, batch_idx, loss.item())
         loss_per_epoch.append(total_loss_one_epoch)
 
         preds, macro, macro_agg = evaluate(
-            model, valid_loader, val_idmap, lbl_itos, cpc=cpc)
+            model, valid_loader, val_idmap, lbl_itos, cpc=cpc, base_model=base_model)
         macro_agg_per_epoch.append(macro_agg)
-
+        
+        writer.add_scalar("Aggregrated Macro for multiple pred", macro_agg, epoch)
+        writer.add_scalar("Macro", macro, epoch)
+        writer.add_scalar("Total_loss_one_epoch", total_loss_one_epoch, epoch)
         print("loss:", total_loss_one_epoch)
+        print("macro:", macro)
         print("aggregated macro:", macro_agg)
         if macro_agg > best_macro_agg:
             torch.save(model.state_dict(), save_model_at)
@@ -395,10 +507,9 @@ def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn,
             best_epoch = epoch
             best_preds = preds
             _, test_macro, test_macro_agg = evaluate(
-                model, test_loader, test_idmap, lbl_itos, cpc=cpc)
+                model, test_loader, test_idmap, lbl_itos, cpc=cpc, base_model=base_model)
 
-        set_train_eval(model, cpc, linear_evaluation)
-
+        set_train_eval(model, cpc, linear_evaluation, base_model)
     if epochs > 0:
         sanity_check(model, state_dict_pre, linear_evaluation, head_only)
     return loss_per_epoch, macro_agg_per_epoch, best_macro, best_macro_agg, test_macro, test_macro_agg, best_epoch, best_preds
@@ -441,9 +552,11 @@ def sanity_check(model, state_dict_pre, linear_evaluation, head_only):
     print("=> sanity check passed.")
 
 
-def eval_model(model, valid_loader, cpc=False):
+def eval_model(model, valid_loader, cpc=False, base_model="xresnet1d"):
     if cpc:
         data_type = model.encoder[0][0].weight.type()
+    elif base_model == 'linear':
+        data_type = model.encoder.weight.type()
     else:
         data_type = model.features[0][0].weight.type()
     model.eval()
@@ -461,37 +574,42 @@ def eval_model(model, valid_loader, cpc=False):
     return preds, targs
 
 
-def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, percentage=1.0, folds=8, t_params=None, test=False, normalize=False):
+def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, percentage=1.0, folds=8, t_params=None, test=False, normalize=False, ptb_xl_label="label_all"):
     if apply_noise:
         transformations = ["BaselineWander",
                            "PowerlineNoise", "EMNoise", "BaselineShift"]
         if normalize:
             transformations.append("Normalize")
         dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-                                       mode="linear_evaluation", transformations=transformations, percentage=percentage, folds=folds, t_params=t_params, test=test, ptb_xl_label="label_all")
+                                       mode="linear_evaluation", transformations=transformations, percentage=percentage, folds=folds, t_params=t_params, test=test, ptb_xl_label=ptb_xl_label)
     else:
         if normalize:
             # always use PTB-XL stats
             transformations = ["Normalize"]
             dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-            mode="linear_evaluation", percentage=percentage, folds=folds, test=test, transformations=transformations, ptb_xl_label="label_all")
+            mode="linear_evaluation", percentage=percentage, folds=folds, test=test, transformations=transformations, ptb_xl_label=ptb_xl_label)
         else:
             dataset = SimCLRDataSetWrapper(batch_size,num_workers,None,"(12, 250)",None,target_folder,[target_folder],None,None,
-                                           mode="linear_evaluation", percentage=percentage, folds=folds, test=test, ptb_xl_label="label_all")
+                                           mode="linear_evaluation", percentage=percentage, folds=folds, test=test, ptb_xl_label=ptb_xl_label)
 
     train_loader, valid_loader = dataset.get_data_loaders()
     return dataset, train_loader, valid_loader
 
 
 if __name__ == "__main__":
+    
     args = parse_args()
+    # create a summary writer using the specified folder name.
+    writer = SummaryWriter("linear_eval_metrics") # TODO(loganesian): don't hardcode this
+    config = load_config(args)
     dataset, train_loader, _ = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=args.test, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.eval_datapath, folds=args.folds, test=args.test, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     _, _, valid_loader = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, folds=args.folds, test=False, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.eval_datapath, folds=args.folds, test=False, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     val_idmap = dataset.val_ds_idmap
+    
     dataset, _, test_loader = get_dataset(
-        args.batch_size, args.num_workers, args.dataset, test=True, normalize=args.normalize)
+        args.batch_size, args.num_workers, args.eval_datapath, test=True, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
     test_idmap = dataset.val_ds_idmap
     lbl_itos = dataset.lbl_itos
     tag = "f=" + str(args.folds) + "_" + args.tag
@@ -511,7 +629,7 @@ if __name__ == "__main__":
             raise("noise level does not exist")
         t_params = t_params_by_level[args.noise_level]
         dataset, _, noise_valid_loader = get_dataset(
-            args.batch_size, args.num_workers, args.dataset, apply_noise=True, t_params=t_params, test=args.test)
+            args.batch_size, args.num_workers, args.eval_datapath, apply_noise=True, t_params=t_params, test=args.test, ptb_xl_label=args.ptb_xl_label)
     else:
         noise_valid_loader = None
     losses, macros, predss, result_macros, result_macros_agg, test_macros, test_macros_agg, noised_macros, noised_macros_agg = [
@@ -530,17 +648,23 @@ if __name__ == "__main__":
             args.model_file), "n=" + str(args.noise_level) + "_"+tag + "res_fin.pkl")
 
     model = load_model(
-        args.linear_evaluation, 71, args.use_pretrained or args.load_finetuned, hidden=args.hidden,
+        args.linear_evaluation, label_to_num_classes[args.ptb_xl_label],
+        args.use_pretrained or args.load_finetuned, hidden=args.hidden, base_model=args.base_model,
         location=args.model_file, discriminative_lr=args.discriminative_lr, method=args.method)
+
+    
     loss_fn, optimizer = configure_optimizer(
-        model, args.batch_size, head_only=True, discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
+        model, args.batch_size, head_only=True, base_model=args.base_model, optimizer_name=args.optimizer_name,
+        discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
+    
+   
     if not args.eval_only:
         print("train model...")
         if not isdir(save_model_at):
             os.mkdir(save_model_at)
-
-        l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.l_epochs, loss_fn,
-                                                                            optimizer, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
+        
+        l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.head_only_epochs, loss_fn,
+                                                                            optimizer, writer, base_model=args.base_model, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                             val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
         if bm != 0:
             print("best macro after head-only training:", bm_agg)
@@ -549,12 +673,13 @@ if __name__ == "__main__":
         if args.f_epochs != 0:
             if args.l_epochs != 0:
                 model = load_model(
-                    False, 71, True, hidden=args.hidden,
+                    False, label_to_num_classes[args.ptb_xl_label], True, hidden=args.hidden, base_model=args.base_model,
                     location=join(save_model_at, "finetuned.pt"), discriminative_lr=args.discriminative_lr, method=args.method)
             loss_fn, optimizer = configure_optimizer(
-                model, args.batch_size, head_only=False, discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
+                model, args.batch_size, head_only=False, base_model=args.base_model, optimizer_name=args.optimizer_name,
+                discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
             l2, m2, bm, bm_agg, tm, tm_agg, ckpt_epoch_fin, preds = train_model(model, train_loader, valid_loader, test_loader, args.f_epochs, loss_fn,
-                                                                                optimizer, head_only=False, linear_evaluation=False, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
+                                                                                optimizer, writer, base_model=args.base_model, head_only=False, linear_evaluation=False, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                                 val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
         losses.append(l1+l2)
         macros.append(m1+m2)
@@ -563,9 +688,9 @@ if __name__ == "__main__":
         result_macros.append(bm)
         result_macros_agg.append(bm_agg)
 
-    else:
+    else: # args.eval_only
         preds, eval_macro, eval_macro_agg = evaluate(
-            model, test_loader, test_idmap, lbl_itos, cpc=(args.method == "cpc"))
+            model, test_loader, test_idmap, lbl_itos, cpc=(args.method == "cpc"), base_model=base_model)
         result_macros.append(eval_macro)
         result_macros_agg.append(eval_macro_agg)
         if args.verbose:
@@ -574,7 +699,7 @@ if __name__ == "__main__":
 
     if noise_valid_loader is not None:
         _, noise_macro, noise_macro_agg = evaluate(
-            model, noise_valid_loader, val_idmap, lbl_itos)
+            model, noise_valid_loader, val_idmap, lbl_itos, base_model=base_model)
         noised_macros.append(noise_macro)
         noised_macros_agg.append(noise_macro_agg)
     res = {"filename": filename, "epochs": args.l_epochs+args.f_epochs, "model_location": args.model_location,
@@ -587,4 +712,12 @@ if __name__ == "__main__":
     print("dumped results to", filename)
     print(res)
     print("Done!")
+    writer.close()
 
+
+ # if args.visualize:
+    #     print("Visualization")
+    #     data, labal = next(iter(train_loader))
+    #     y = model(data)
+    #     make_dot(y.mean(), params=dict(model.named_parameters()))
+    #     pass 
