@@ -32,9 +32,6 @@ from torchviz import make_dot
 # --model_file "./experiment_logs/Tue Nov 15 00:01:44 2022_simclr_000_RRC TO /checkpoints/model.ckpt"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# create a summary writer using the specified folder name.
-writer = SummaryWriter("linear_eval_metrics") # TODO(loganesian): don't hardcode this
-
 label_to_num_classes = {"label_all": 71, "label_diag": 44, "label_form": 19,
     "label_rhythm": 12, "label_diag_subclass": 23, "label_diag_superclass": 5}
 
@@ -47,7 +44,7 @@ def parse_args():
     parser.add_argument('--optimizer_name', type=str, default="Adam",
                         choices=["Adam", "SGD"], help='Optimizer to use.')
     parser.add_argument("--discriminative_lr", default=False, action="store_true")
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--hidden", default=False, action="store_true")
     parser.add_argument("--lr_schedule", default="{}")
     parser.add_argument("--use_pretrained", default=False, action="store_true")
@@ -174,7 +171,7 @@ def adjust(model, num_classes, hidden=False, base_model="xresnet1d"):
 
 def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=False, base_model="xresnet1d", optimizer_name="adam", discriminative_lr_factor=1):
     loss_fn = F.binary_cross_entropy_with_logits
-    if base_model == "xresnet1d":
+    if "xresnet1d" in base_model:
         wd = 1e-1
         if head_only:
             lr = (8e-3*(batch_size/256))
@@ -249,7 +246,9 @@ def configure_optimizer(model, batch_size, head_only=False, discriminative_lr=Fa
     elif base_model == "linear":
         wd = 1e-1
         if head_only:
+            # 8e-3*(batch_size/256) = 0.016
             lr = (8e-3*(batch_size/256)) # TODO(loganesian): Not sure where this is from.
+            # lr = 0.1
             if optimizer_name == 'Adam':
                 optimizer = torch.optim.AdamW(model.l1.parameters(), lr=lr,
                     weight_decay=wd)
@@ -327,7 +326,7 @@ def load_model(linear_evaluation, num_classes, use_pretrained, discriminative_lr
                 model_state_dict = lightning_state_dict
             model.load_state_dict(model_state_dict)
         
-        elif base_model == "xresnet1d":
+        elif "xresnet1d" in base_model:
             model = ResNetSimCLR(base_model, out_dim, hidden=hidden, widen=widen).to(device)
             model_state_dict = torch.load(location, map_location=device)
             if "state_dict" in model_state_dict.keys():
@@ -426,7 +425,7 @@ def set_train_eval(model, cpc, linear_evaluation, base_model="xresnet1d"):
         model.train()
 
 
-def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, base_model="xresnet1d50", head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
+def train_model(model, train_loader, valid_loader, test_loader, epochs, loss_fn, optimizer, writer, base_model="xresnet1d50", head_only=True, linear_evaluation=False, percentage=1, lr_schedule=None, save_model_at=None, val_idmap=None, test_idmap=None, lbl_itos=None, cpc=False):
     
     if head_only:
         if linear_evaluation:
@@ -600,6 +599,8 @@ def get_dataset(batch_size, num_workers, target_folder, apply_noise=False, perce
 if __name__ == "__main__":
     
     args = parse_args()
+    # create a summary writer using the specified folder name.
+    writer = SummaryWriter("linear_eval_metrics") # TODO(loganesian): don't hardcode this
     config = load_config(args)
     dataset, train_loader, _ = get_dataset(
         args.batch_size, args.num_workers, args.eval_datapath, folds=args.folds, test=args.test, normalize=args.normalize, ptb_xl_label=args.ptb_xl_label)
@@ -663,7 +664,7 @@ if __name__ == "__main__":
             os.mkdir(save_model_at)
         
         l1, m1, bm, bm_agg, tm, tm_agg, ckpt_epoch_lin, preds = train_model(model, train_loader, valid_loader, test_loader, args.head_only_epochs, loss_fn,
-                                                                            optimizer, base_model=args.base_model, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
+                                                                            optimizer, writer, base_model=args.base_model, head_only=True, linear_evaluation=args.linear_evaluation, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                             val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
         if bm != 0:
             print("best macro after head-only training:", bm_agg)
@@ -678,7 +679,7 @@ if __name__ == "__main__":
                 model, args.batch_size, head_only=False, base_model=args.base_model, optimizer_name=args.optimizer_name,
                 discriminative_lr=args.discriminative_lr, discriminative_lr_factor=0.1 if args.use_pretrained and args.discriminative_lr else 1)
             l2, m2, bm, bm_agg, tm, tm_agg, ckpt_epoch_fin, preds = train_model(model, train_loader, valid_loader, test_loader, args.f_epochs, loss_fn,
-                                                                                optimizer, base_model=args.base_model, head_only=False, linear_evaluation=False, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
+                                                                                optimizer, writer, base_model=args.base_model, head_only=False, linear_evaluation=False, lr_schedule=args.lr_schedule, save_model_at=join(save_model_at, "finetuned.pt"),
                                                                                 val_idmap=val_idmap, test_idmap=test_idmap, lbl_itos=lbl_itos, cpc=(args.method == "cpc"))
         losses.append(l1+l2)
         macros.append(m1+m2)
